@@ -1,12 +1,12 @@
 # recommendations-letterboxd
 
 A personal film recommender trained on a Letterboxd export, built to surface
-niche and underrated films rather than whatever is popular and well-rated.
+niche and underrated films rather than just popular and well-rated ones.
 
 ## Layout
 
 ```
-Data/                    raw Letterboxd export -- immutable input, never written to
+Data/                    raw Letterboxd export, immutable input
 artifacts/               everything derived; reproducible, gitignored
   cache/                 raw HTTP responses, keyed by request
   external/              third-party bulk datasets (MovieLens, IMDb)
@@ -17,8 +17,7 @@ src/lbrec/               the package
 tests/
 ```
 
-The export directory is a parameter, not a constant, because the eventual web
-app has to ingest other people's exports the same way it ingests this one.
+The export directory is a parameter
 
 ## Setup
 
@@ -37,19 +36,19 @@ cp .env.example .env      # then fill in the TMDb token
 
 ### ID resolution
 
-The export carries a boxd.it slug, a title and a year -- no external ID. Every
+The export carries a boxd.it slug, a title and a year with no external ID. Every
 dataset the project joins against keys on TMDb or IMDb IDs, so this mapping is
 the join key everything else rests on.
 
-Matching is deliberately conservative: **a wrong ID is worse than a missing
-one.** A missing film is visibly absent; a wrong one silently attaches another
-film's synopsis, cast and popularity to a rating. Confidence tiers:
+Matching is deliberately conservative: a wrong ID is worse than a missing
+one. A missing film is visibly absent; a wrong one attaches another
+film. Confidence tiers:
 
 | tier | rule | auto-used? |
 | --- | --- | --- |
 | `exact` | a title form matches verbatim, year within 1 | yes |
 | `high` | similarity >= 90, year within 1 | yes |
-| `medium` | similarity >= 85, year within 2 | **no -- goes to review** |
+| `medium` | similarity >= 85, year within 2 | Needs review |
 | `unresolved` | nothing met the bar | no |
 | `override` | a human decided | yes |
 
@@ -59,7 +58,7 @@ Guards that earned their place on real data:
   under threshold. Leading and trailing articles are stripped as extra
   comparison forms, which can only raise a score, never lower one.
 - **Sequel markers.** "Drunken Master II" scores 97.1 against "Drunken Master
-  III" -- fuzzy similarity barely notices a roman numeral. A differing trailing
+  III". A fuzzy similarity barely notices a roman numeral. A differing trailing
   number rejects the candidate outright.
 - **Literal beats variant.** Article stripping makes "The Stalker" tie with
   "Stalker"; a verbatim title match outranks a variant one.
@@ -70,9 +69,8 @@ Responses are cached under `artifacts/cache/tmdb/`, keyed by request with the
 credential excluded, so re-running costs nothing and rotating the key does not
 invalidate the cache.
 
-TMDb accepts two credential formats -- a 32-hex-character v3 key (query
-parameter) and a v4 JWT (bearer header) -- and pasting one where the other is
-expected returns an unhelpful 401. The client detects the format from the value
+TMDb accepts two credential formats. 32-hex-character v3 key (query
+parameter) and a v4 JWT (bearer header). The client detects the format from the value
 rather than from which variable it was placed in.
 
 ### Television
