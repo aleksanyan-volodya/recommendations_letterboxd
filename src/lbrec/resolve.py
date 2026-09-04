@@ -22,7 +22,7 @@ enrichment pass, which fetches ``/movie/{id}`` once per resolved film.
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pandas as pd
@@ -44,11 +44,16 @@ MEDIUM_TITLE_SCORE = 85.0
 HIGH_YEAR_DELTA = 1
 MEDIUM_YEAR_DELTA = 2
 
+#: TMDb keeps film and television in separate namespaces.
+MEDIA_MOVIE = "movie"
+MEDIA_TV = "tv"
+
 FILM_MAP_COLUMNS = [
     "film_key",
     "title",
     "year",
     "tmdb_id",
+    "media_type",
     "tmdb_title",
     "tmdb_year",
     "confidence",
@@ -57,12 +62,22 @@ FILM_MAP_COLUMNS = [
     "source",
 ]
 
+#: Tiers downstream code may use without a human having looked.
+TRUSTED_CONFIDENCES = frozenset({EXACT, HIGH, OVERRIDE})
+
+#: Tiers that go to the review file. MEDIUM is included deliberately: it is
+#: right most of the time, and confirming a handful of rows by hand is cheaper
+#: than one silently wrong ID propagating through every later stage.
+REVIEW_CONFIDENCES = frozenset({UNRESOLVED, MEDIUM})
+
 REVIEW_COLUMNS = [
     "film_key",
     "title",
     "year",
     "letterboxd_url",
     "tmdb_id",
+    "media_type",
+    "auto_match",
     "suggestion_1",
     "suggestion_2",
     "suggestion_3",
@@ -105,6 +120,40 @@ def title_variants(normalized: str) -> set[str]:
     return variants
 
 
+#: Roman numerals used as sequel markers. Deliberately small: only the forms
+#: that actually appear at the end of film titles.
+_ROMAN = frozenset("i ii iii iv v vi vii viii ix x xi xii xiii".split())
+
+
+def sequel_marker(normalized: str) -> str | None:
+    """The trailing sequel designator of a title, if it has one.
+
+    Sequel numbers are one or two characters inside otherwise identical titles,
+    so fuzzy similarity barely notices them: "drunken master ii" scores 97
+    against "drunken master iii". Comparing the markers explicitly is the only
+    reliable way to keep entries in a series apart.
+
+    Returns ``None`` for single-token titles, so a film actually called "X" or
+    "Ran" is not read as a sequel marker.
+    """
+    tokens = normalized.split()
+    if len(tokens) < 2:
+        return None
+    last = tokens[-1]
+    if last.isdigit() or last in _ROMAN:
+        return last
+    return None
+
+
+def sequel_conflict(query: str, candidate_forms: set[str]) -> bool:
+    """True when no candidate title carries the same sequel marker as the query.
+
+    Also catches the asymmetric case ("Blade Runner" vs "Blade Runner 2049"),
+    where one title has a trailing number and the other does not.
+    """
+    return all(sequel_marker(query) != sequel_marker(form) for form in candidate_forms)
+
+
 def letterboxd_url(film_key: str) -> str:
     """Clickable link for the human review pass."""
     return "" if film_key.startswith("ty:") else f"https://boxd.it/{film_key}"
@@ -113,25 +162,45 @@ def letterboxd_url(film_key: str) -> str:
 # --------------------------------------------------------------------------
 # overrides
 # --------------------------------------------------------------------------
-def load_overrides(path: Path) -> dict[str, int | None]:
+OVERRIDE_COLUMNS = ["film_key", "tmdb_id", "media_type", "title", "note"]
+
+
+@dataclass(frozen=True)
+class Override:
+    """One hand-written correction.
+
+    ``tmdb_id is None`` means "deliberately unmatchable, stop asking", which is
+    distinct from a film that was simply never reviewed.
+    """
+
+    tmdb_id: int | None
+    media_type: str = MEDIA_MOVIE
+
+
+def load_overrides(path: Path) -> dict[str, Override]:
     """Read hand-written corrections.
 
-    An empty ``tmdb_id`` means "deliberately unmatchable, stop asking" and is
-    stored as ``None`` -- distinct from a film that was simply never reviewed.
+    ``media_type`` matters: a series resolved by hand must keep its TMDb
+    namespace, or it would later be looked up as a film and silently vanish.
     """
     if not path.exists():
         return {}
-    overrides: dict[str, int | None] = {}
+    overrides: dict[str, Override] = {}
     with path.open("r", newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
             key = (row.get("film_key") or "").strip()
             if not key:
                 continue
             raw = (row.get("tmdb_id") or "").strip()
+            media = (row.get("media_type") or "").strip().lower() or MEDIA_MOVIE
             try:
-                overrides[key] = int(raw) if raw else None
+                tmdb_id = int(raw) if raw else None
             except ValueError:
-                overrides[key] = None
+                tmdb_id = None
+            overrides[key] = Override(
+                tmdb_id=tmdb_id,
+                media_type=media if media in {MEDIA_MOVIE, MEDIA_TV} else MEDIA_MOVIE,
+            )
     return overrides
 
 
@@ -142,11 +211,11 @@ def append_overrides(path: Path, rows: list[dict[str, str]]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
     with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["film_key", "tmdb_id", "title", "note"])
+        writer = csv.DictWriter(handle, fieldnames=OVERRIDE_COLUMNS)
         if not exists:
             writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow({column: row.get(column, "") for column in OVERRIDE_COLUMNS})
     return len(rows)
 
 
@@ -161,6 +230,25 @@ class Match:
     confidence: str
     title_score: float
     year_delta: int | None
+    media_type: str = MEDIA_MOVIE
+
+
+NO_MATCH = Match(None, "", None, UNRESOLVED, 0.0, None)
+
+
+def tv_as_movie(result: dict) -> dict:
+    """Reshape a TV search result into the movie field names.
+
+    Lets one scoring path serve both namespaces instead of duplicating the
+    thresholds, the sequel guard and the article variants for television.
+    """
+    return {
+        "id": result.get("id"),
+        "title": result.get("name") or "",
+        "original_title": result.get("original_name") or "",
+        "release_date": result.get("first_air_date") or "",
+        "popularity": result.get("popularity") or 0.0,
+    }
 
 
 def _candidate_year(candidate: dict) -> int | None:
@@ -224,10 +312,17 @@ def score_candidates(title: str, year: int | None, candidates: list[dict]) -> Ma
         candidate_year = _candidate_year(candidate)
         delta = None if (year is None or candidate_year is None) else abs(candidate_year - year)
 
+        forms = candidate_titles(candidate)
+        # A differing sequel number means a different film, whatever the
+        # similarity score says. Reject rather than demote: entries in a series
+        # are exactly where a confident wrong ID does the most damage.
+        if sequel_conflict(normalized, forms):
+            continue
+
         literal_title = normalized in {
             normalize_title(candidate.get(key) or "") for key in ("title", "original_title")
         }
-        exact_title = bool(query_forms & candidate_titles(candidate))
+        exact_title = bool(query_forms & forms)
         if exact_title and delta is not None and delta <= HIGH_YEAR_DELTA:
             confidence = EXACT
         elif score >= HIGH_TITLE_SCORE and delta is not None and delta <= HIGH_YEAR_DELTA:
@@ -254,34 +349,60 @@ def score_candidates(title: str, year: int | None, candidates: list[dict]) -> Ma
         if confidence == EXACT and literal_title:
             break
 
-    return best or Match(None, "", None, UNRESOLVED, 0.0, None)
+    return best or NO_MATCH
 
 
 #: Confidence ordering, for comparing two candidate matches.
 _RANK = {EXACT: 3, HIGH: 2, MEDIUM: 1, UNRESOLVED: 0}
 
 
-def resolve_film(client: TmdbClient, title: str, year: int | None) -> Match:
-    """Search TMDb for one film: year-constrained first, then unconstrained.
+def resolve_film(
+    client: TmdbClient, title: str, year: int | None, *, allow_tv: bool = True
+) -> Match:
+    """Search TMDb for one entry: film first, then television.
 
     Searches run lazily and stop at the first exact hit, so the common case
     costs a single request. TMDb's ``primary_release_year`` filter can hide the
-    right film when its release dates disagree across regions, which is what
-    the unconstrained retry is for.
+    right film when release dates disagree across regions, which is what the
+    unconstrained retry is for.
+
+    Television is only consulted once the film namespace has failed to produce
+    an exact match, so a film is never displaced by a like-named series. Matches
+    are stamped with ``media_type``: TV entries are taste signal only and are
+    excluded from the recommendation catalog.
     """
     if not title.strip():
-        return Match(None, "", None, UNRESOLVED, 0.0, None)
+        return NO_MATCH
 
-    queries: list[dict] = []
+    best = NO_MATCH
+
+    movie_queries: list[dict] = []
     if year is not None:
-        queries.append({"primary_release_year": year})
-    queries.append({})
-
-    best = Match(None, "", None, UNRESOLVED, 0.0, None)
-    for params in queries:
+        movie_queries.append({"primary_release_year": year})
+    movie_queries.append({})
+    for params in movie_queries:
         match = score_candidates(title, year, client.search_movie(title, **params))
         if match.confidence == EXACT:
             return match
+        if _RANK[match.confidence] > _RANK[best.confidence]:
+            best = match
+
+    if not allow_tv:
+        return best
+
+    tv_queries: list[dict] = []
+    if year is not None:
+        tv_queries.append({"first_air_date_year": year})
+    tv_queries.append({})
+    for params in tv_queries:
+        results = [tv_as_movie(result) for result in client.search_tv(title, **params)]
+        match = score_candidates(title, year, results)
+        if match.confidence == UNRESOLVED:
+            continue
+        match = replace(match, media_type=MEDIA_TV)
+        if match.confidence == EXACT:
+            return match
+        # A film match of equal confidence wins: only improve on `best`.
         if _RANK[match.confidence] > _RANK[best.confidence]:
             best = match
     return best
@@ -293,7 +414,7 @@ def resolve_film(client: TmdbClient, title: str, year: int | None) -> Match:
 def resolve_films(
     client: TmdbClient,
     films: pd.DataFrame,
-    overrides: dict[str, int | None],
+    overrides: dict[str, Override],
     *,
     progress=None,
 ) -> pd.DataFrame:
@@ -303,13 +424,15 @@ def resolve_films(
         year = int(film.year) if pd.notna(film.year) else None
 
         if film.film_key in overrides:
-            tmdb_id = overrides[film.film_key]
+            override = overrides[film.film_key]
+            tmdb_id = override.tmdb_id
             records.append(
                 {
                     "film_key": film.film_key,
                     "title": film.title,
                     "year": year,
                     "tmdb_id": tmdb_id,
+                    "media_type": override.media_type if tmdb_id is not None else None,
                     "tmdb_title": "",
                     "tmdb_year": None,
                     "confidence": OVERRIDE if tmdb_id is not None else UNRESOLVED,
@@ -326,6 +449,7 @@ def resolve_films(
                     "title": film.title,
                     "year": year,
                     "tmdb_id": match.tmdb_id,
+                    "media_type": match.media_type if match.tmdb_id is not None else None,
                     "tmdb_title": match.tmdb_title,
                     "tmdb_year": match.tmdb_year,
                     "confidence": match.confidence,
@@ -347,11 +471,13 @@ def resolve_films(
 def build_review_table(client: TmdbClient, film_map: pd.DataFrame) -> pd.DataFrame:
     """Rows a human must decide on, with TMDb's top guesses for context.
 
-    ``tmdb_id`` is left blank for the reviewer to fill in.
+    Covers unresolved films and medium-confidence ones. ``auto_match`` shows
+    what the matcher proposed, if anything; ``tmdb_id`` is left blank so a row
+    only counts as reviewed once a person has filled it in.
     """
-    unresolved = film_map[film_map["confidence"] == UNRESOLVED]
+    pending = film_map[film_map["confidence"].isin(REVIEW_CONFIDENCES)]
     records = []
-    for film in unresolved.itertuples(index=False):
+    for film in pending.itertuples(index=False):
         year = int(film.year) if pd.notna(film.year) else None
         candidates = client.search_movie(film.title)[:3]
         suggestions = [
@@ -359,6 +485,12 @@ def build_review_table(client: TmdbClient, film_map: pd.DataFrame) -> pd.DataFra
             for c in candidates
         ]
         suggestions += [""] * (3 - len(suggestions))
+        auto = (
+            f"{film.tmdb_id} | {film.tmdb_title} ({film.tmdb_year}) "
+            f"[{film.confidence}, {film.media_type}]"
+            if pd.notna(film.tmdb_id)
+            else ""
+        )
         records.append(
             {
                 "film_key": film.film_key,
@@ -366,6 +498,8 @@ def build_review_table(client: TmdbClient, film_map: pd.DataFrame) -> pd.DataFra
                 "year": year,
                 "letterboxd_url": letterboxd_url(film.film_key),
                 "tmdb_id": "",
+                "media_type": MEDIA_MOVIE,
+                "auto_match": auto,
                 "suggestion_1": suggestions[0],
                 "suggestion_2": suggestions[1],
                 "suggestion_3": suggestions[2],
@@ -389,10 +523,12 @@ def read_reviewed(path: Path) -> list[dict[str, str]]:
             # A note alone records a deliberate decision not to match.
             if not key or (not tmdb_id and not note):
                 continue
+            media = (row.get("media_type") or "").strip().lower()
             rows.append(
                 {
                     "film_key": key,
                     "tmdb_id": tmdb_id,
+                    "media_type": media if media in {MEDIA_MOVIE, MEDIA_TV} else MEDIA_MOVIE,
                     "title": (row.get("title") or "").strip(),
                     "note": note,
                 }

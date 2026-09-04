@@ -199,5 +199,24 @@ class TmdbClient:
         )
         return list(body.get("results", [])) if body else []
 
+    def search_tv(
+        self, query: str, *, first_air_date_year: int | None = None, page: int = 1
+    ) -> list[dict[str, Any]]:
+        """Search the TV namespace.
+
+        Letterboxd lists some miniseries and specials, which ``/search/movie``
+        structurally cannot find. Results use ``name``/``first_air_date`` rather
+        than ``title``/``release_date``.
+        """
+        body = self.get(
+            "/search/tv",
+            query=query,
+            first_air_date_year=first_air_date_year,
+            page=page,
+            include_adult="true",
+            language="en-US",
+        )
+        return list(body.get("results", [])) if body else []
+
     def movie(self, tmdb_id: int, *, append: str = "external_ids") -> dict[str, Any] | None:
         return self.get(f"/movie/{tmdb_id}", append_to_response=append, language="en-US")

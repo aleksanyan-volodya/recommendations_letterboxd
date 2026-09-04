@@ -17,7 +17,8 @@ from tqdm import tqdm
 from lbrec.config import get_settings
 from lbrec.letterboxd import coverage_report, film_status, load_export
 from lbrec.resolve import (
-    UNRESOLVED,
+    REVIEW_CONFIDENCES,
+    TRUSTED_CONFIDENCES,
     append_overrides,
     build_review_table,
     load_overrides,
@@ -145,13 +146,14 @@ def resolve(
     counts["share"] = (counts["films"] / len(film_map)).map("{:.1%}".format)
     _render(counts, "Match confidence")
 
-    resolved = int(film_map["tmdb_id"].notna().sum())
+    trusted = int(film_map["confidence"].isin(TRUSTED_CONFIDENCES).sum())
+    pending = int(film_map["confidence"].isin(REVIEW_CONFIDENCES).sum())
     console.print(
-        f"[bold]{resolved}[/bold] / {len(film_map)} resolved "
-        f"([bold]{len(film_map) - resolved}[/bold] need review)"
+        f"[bold]{trusted}[/bold] / {len(film_map)} usable without review "
+        f"([bold]{pending}[/bold] awaiting a human)"
     )
     console.print(f"wrote {settings.film_map_path.relative_to(settings.artifacts_dir.parent)}")
-    if review and (film_map["confidence"] == UNRESOLVED).any():
+    if review and pending:
         console.print(
             f"wrote {settings.unresolved_path.relative_to(settings.artifacts_dir.parent)} "
             "-- fill in the tmdb_id column, then run `lbrec resolve-apply`"
