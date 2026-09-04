@@ -17,10 +17,12 @@ from tqdm import tqdm
 from lbrec.config import get_settings
 from lbrec.letterboxd import coverage_report, film_status, load_export
 from lbrec.resolve import (
+    OVERRIDE,
     REVIEW_CONFIDENCES,
     TRUSTED_CONFIDENCES,
     append_overrides,
     build_review_table,
+    duplicate_ids,
     load_overrides,
     read_reviewed,
     resolve_films,
@@ -147,12 +149,27 @@ def resolve(
     _render(counts, "Match confidence")
 
     trusted = int(film_map["confidence"].isin(TRUSTED_CONFIDENCES).sum())
-    pending = int(film_map["confidence"].isin(REVIEW_CONFIDENCES).sum())
+    # Films already decided by hand are not awaiting anyone, including those
+    # recorded as deliberately unmatchable.
+    pending = int(
+        (film_map["confidence"].isin(REVIEW_CONFIDENCES) & (film_map["source"] != OVERRIDE)).sum()
+    )
+    decided_absent = len(film_map) - trusted - pending
     console.print(
-        f"[bold]{trusted}[/bold] / {len(film_map)} usable without review "
-        f"([bold]{pending}[/bold] awaiting a human)"
+        f"[bold]{trusted}[/bold] / {len(film_map)} resolved, "
+        f"[bold]{pending}[/bold] awaiting a human"
+        + (f", {decided_absent} recorded as not on TMDb" if decided_absent else "")
     )
     console.print(f"wrote {settings.film_map_path.relative_to(settings.artifacts_dir.parent)}")
+
+    collisions = duplicate_ids(film_map)
+    if not collisions.empty:
+        console.print(
+            f"[yellow]{collisions['tmdb_id'].nunique()} TMDb id(s) claimed by more than one "
+            "film -- these would double-count:[/yellow]"
+        )
+        _render(collisions[["film_key", "title", "year", "tmdb_id", "confidence"]], "Collisions")
+
     if review and pending:
         console.print(
             f"wrote {settings.unresolved_path.relative_to(settings.artifacts_dir.parent)} "

@@ -1,0 +1,20 @@
+film_key,tmdb_id,media_type,title,note
+1Si0,12207,movie,Drunken Master II,= The Legend of Drunken Master
+1Yms,9564,movie,Asterix and Obelix vs. Caesar,
+1v6K,25793,movie,Precious,TMDb title: Precious: Based on the Novel 'Push'
+29l6,896,movie,Apur Sansar,= The World of Apu
+4mhU,134908,movie,Horses of God,TMDb year 2013 vs LB 2011
+8j4w,273854,movie,Leila and the Wolves,TMDb year 1986 vs LB 1984
+B4Le,258216,movie,Nymphomaniac,LB has one entry; TMDb splits Vol I/II -- Vol I chosen
+CyUM,1019939,movie,Hundreds of Beavers,"2022 premiere, 2024 TMDb release"
+T18,44012,movie,"Jeanne Dielman, 23, quai du Commerce, 1080 Bruxelles",
+cDVy,365501,movie,Compensation,TMDb release date wrong (2025); imdb tt0223027 confirms the 1999 film
+mp2,57564,movie,Rebels of the Neon God,TMDb year 1994 vs LB 1992
+oEE8,662400,movie,Days,TMDb year 2021 vs LB 2020
+uqVQ,808482,movie,The People's Joker,"2022 premiere, 2024 TMDb release"
+xyq8,1186186,movie,Peter's Computer - Desktop Cleanup,"user-supplied; TMDb entry is 'Gorilla Video', a different short in the series"
+73Gi,,,Twisted: The Untold Story of a Royal Vizier,not on TMDb
+E8uM,,,Thin Watermelon,not on TMDb
+hufy,,,Nathan for You: Finding Frances,"episode of a series, no standalone TMDb entry"
+rQx0,,,"history of the entire world, i guess","web video, not on TMDb"
+B4Le,249397,movie,Nymphomaniac,"corrects 258216: Vol. I is already in the library as 7DiG, so the combined entry maps to Vol. II"

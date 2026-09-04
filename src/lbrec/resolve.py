@@ -182,6 +182,9 @@ def load_overrides(path: Path) -> dict[str, Override]:
 
     ``media_type`` matters: a series resolved by hand must keep its TMDb
     namespace, or it would later be looked up as a film and silently vanish.
+
+    The file is append-only, so a later row for the same ``film_key`` wins. That
+    is how a correction is recorded without rewriting history.
     """
     if not path.exists():
         return {}
@@ -474,8 +477,14 @@ def build_review_table(client: TmdbClient, film_map: pd.DataFrame) -> pd.DataFra
     Covers unresolved films and medium-confidence ones. ``auto_match`` shows
     what the matcher proposed, if anything; ``tmdb_id`` is left blank so a row
     only counts as reviewed once a person has filled it in.
+
+    Rows already decided by hand are excluded, including deliberate non-matches:
+    once someone has recorded that a film is not on TMDb, asking again every run
+    would bury the rows that still need attention.
     """
-    pending = film_map[film_map["confidence"].isin(REVIEW_CONFIDENCES)]
+    pending = film_map[
+        film_map["confidence"].isin(REVIEW_CONFIDENCES) & (film_map["source"] != OVERRIDE)
+    ]
     records = []
     for film in pending.itertuples(index=False):
         year = int(film.year) if pd.notna(film.year) else None
@@ -507,6 +516,18 @@ def build_review_table(client: TmdbClient, film_map: pd.DataFrame) -> pd.DataFra
             }
         )
     return pd.DataFrame.from_records(records, columns=REVIEW_COLUMNS)
+
+
+def duplicate_ids(film_map: pd.DataFrame) -> pd.DataFrame:
+    """Films sharing one TMDb ID.
+
+    Usually a real mistake and it would double-count that film's interactions. Occasionally
+    legitimate, when Letterboxd splits something TMDb keeps whole, so this is
+    surfaced rather than enforced.
+    """
+    resolved = film_map[film_map["tmdb_id"].notna()]
+    duplicates = resolved[resolved.duplicated("tmdb_id", keep=False)]
+    return duplicates.sort_values(["tmdb_id", "film_key"], ignore_index=True)
 
 
 def read_reviewed(path: Path) -> list[dict[str, str]]:

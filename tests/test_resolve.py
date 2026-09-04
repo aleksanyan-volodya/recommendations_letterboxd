@@ -23,6 +23,7 @@ from lbrec.resolve import (
     Override,
     append_overrides,
     build_review_table,
+    duplicate_ids,
     load_overrides,
     read_reviewed,
     resolve_film,
@@ -303,6 +304,44 @@ def test_overrides_round_trip(tmp_path: Path):
     }
 
 
+def test_a_later_override_row_supersedes_an_earlier_one(tmp_path: Path):
+    """Corrections are appended, never rewritten, so the last decision wins."""
+    path = tmp_path / "overrides.csv"
+    append_overrides(path, [{"film_key": "B4Le", "tmdb_id": "258216", "title": "Nymphomaniac"}])
+    append_overrides(
+        path,
+        [{"film_key": "B4Le", "tmdb_id": "249397", "title": "Nymphomaniac", "note": "Vol. II"}],
+    )
+    assert load_overrides(path)["B4Le"] == Override(249397, MEDIA_MOVIE)
+    assert "258216" in path.read_text()  # the earlier decision is still on record
+
+
+def test_decided_non_matches_do_not_come_back_to_review(tmp_path: Path):
+    """A recorded "not on TMDb" must stop being asked about every run."""
+    film_map = pd.DataFrame(
+        [
+            _review_row(film_key="aaaa", confidence=UNRESOLVED, source=OVERRIDE),
+            _review_row(film_key="bbbb", confidence=UNRESOLVED, source="auto"),
+        ]
+    )
+    transport = RecordingTransport(lambda r: httpx.Response(200, json={"results": []}))
+    with TmdbClient(make_settings(tmp_path), transport=transport) as client:
+        review = build_review_table(client, film_map)
+    assert review["film_key"].tolist() == ["bbbb"]
+
+
+def test_duplicate_ids_are_reported(tmp_path: Path):
+    film_map = pd.DataFrame(
+        [
+            _review_row(film_key="7DiG", tmdb_id=258216, confidence=EXACT),
+            _review_row(film_key="B4Le", tmdb_id=258216, confidence=OVERRIDE),
+            _review_row(film_key="cccc", tmdb_id=999, confidence=EXACT),
+            _review_row(film_key="dddd", tmdb_id=pd.NA, confidence=UNRESOLVED),
+        ]
+    )
+    assert duplicate_ids(film_map)["film_key"].tolist() == ["7DiG", "B4Le"]
+
+
 def test_hand_resolved_tv_keeps_its_namespace(tmp_path: Path):
     """A series resolved by hand must not later be looked up as a film."""
     films = pd.DataFrame([{"film_key": "mkbG", "title": "Chernobyl", "year": 2019}])
@@ -339,6 +378,7 @@ def _review_row(**overrides):
         "title": "Obscure",
         "year": 1974,
         "confidence": UNRESOLVED,
+        "source": "auto",
         "tmdb_id": pd.NA,
         "media_type": pd.NA,
         "tmdb_title": "",
