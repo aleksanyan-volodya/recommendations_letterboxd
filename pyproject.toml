@@ -13,6 +13,8 @@ dependencies = [
     "rapidfuzz>=3.9",
     "python-dotenv>=1.0",
     "tqdm>=4.66",
+    "scikit-learn>=1.9.0",
+    "xgboost>=3.4.1",
 ]
 
 [project.scripts]

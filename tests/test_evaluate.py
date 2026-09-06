@@ -34,6 +34,11 @@ def make_catalogue(n: int = 120, seed: int = 0) -> pd.DataFrame:
             "vote_count": pd.Series(rng.integers(1, 40_000, n), dtype="Int64"),
             "vote_average": pd.Series(rng.uniform(4, 9, n), dtype="Float64"),
             "original_language": ["en" if i % 2 else "fr" for i in range(n)],
+            "overview": [
+                f"A {genres[i % 4].lower()} about theme{i % 11} and theme{i % 7} set in a city."
+                for i in range(n)
+            ],
+            "tagline": ["" for _ in range(n)],
         }
     )
 
