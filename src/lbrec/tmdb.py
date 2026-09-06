@@ -220,3 +220,6 @@ class TmdbClient:
 
     def movie(self, tmdb_id: int, *, append: str = "external_ids") -> dict[str, Any] | None:
         return self.get(f"/movie/{tmdb_id}", append_to_response=append, language="en-US")
+
+    def tv(self, tmdb_id: int, *, append: str = "external_ids") -> dict[str, Any] | None:
+        return self.get(f"/tv/{tmdb_id}", append_to_response=append, language="en-US")
