@@ -16,6 +16,8 @@ artifacts/
 
 Data/
 
+TODO.md
+
 # Tooling
 .pytest_cache/
 .ruff_cache/
