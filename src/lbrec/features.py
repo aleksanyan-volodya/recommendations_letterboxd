@@ -96,6 +96,13 @@ class TextBlock(BaseEstimator, TransformerMixin):
 
     The component count is likewise clamped to what the fitted vocabulary can
     support, since ``TruncatedSVD`` cannot ask for more dimensions than features.
+
+    SVD output is standardised afterwards. Ridge applies a single penalty to
+    every coefficient, so a block whose columns happen to be large is
+    effectively regularised *less* than one whose columns are small. Raw SVD
+    components carry the singular values and so dwarf L2-normalised TF-IDF and
+    standardised numerics sitting beside them -- an arbitrary weighting, not a
+    modelling decision.
     """
 
     def __init__(self, *, components: int | None = None, **vectorizer_kwargs) -> None:
@@ -105,6 +112,7 @@ class TextBlock(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):  # noqa: N803 - sklearn's parameter name
         self.vectorizer_ = TfidfVectorizer(**self.vectorizer_kwargs)
         self.svd_ = None
+        self.scaler_ = None
         try:
             matrix = self.vectorizer_.fit_transform(X)
         except ValueError:  # empty vocabulary
@@ -114,13 +122,17 @@ class TextBlock(BaseEstimator, TransformerMixin):
             usable = min(self.components, matrix.shape[1] - 1)
             if usable >= 1:
                 self.svd_ = TruncatedSVD(n_components=usable, random_state=0).fit(matrix)
+                self.scaler_ = StandardScaler().fit(self.svd_.transform(matrix))
         return self
 
     def transform(self, X):  # noqa: N803
         if self.vectorizer_ is None:
             return np.zeros((len(X), 1))
         matrix = self.vectorizer_.transform(X)
-        return self.svd_.transform(matrix) if self.svd_ is not None else matrix.toarray()
+        if self.svd_ is None:
+            return matrix.toarray()
+        reduced = self.svd_.transform(matrix)
+        return self.scaler_.transform(reduced) if self.scaler_ is not None else reduced
 
 
 def _text_pipeline(max_features: int, components: int | None = None) -> TextBlock:
@@ -132,57 +144,76 @@ def _text_pipeline(max_features: int, components: int | None = None) -> TextBloc
     )
 
 
+#: Blocks available for every film in the export.
+FULL_BLOCKS = (
+    "genres",
+    "keywords",
+    "directors",
+    "cast",
+    "countries",
+    "synopsis",
+    "numeric",
+    "language",
+)
+
+#: Blocks available for every film in the candidate catalogue. The crowd dump
+#: carries no keywords, cast or crew, so a model meant to score the catalogue
+#: must be *trained* without them too -- otherwise it applies coefficients
+#: learned on features that are uniformly absent at inference time, which is a
+#: train/inference mismatch rather than a recommendation.
+CATALOGUE_BLOCKS = ("genres", "countries", "synopsis", "numeric", "language")
+
+
 def build_preprocessor(
     *,
     keyword_components: int = KEYWORD_COMPONENTS,
     synopsis_components: int = SYNOPSIS_COMPONENTS,
+    blocks: tuple[str, ...] = FULL_BLOCKS,
 ) -> ColumnTransformer:
     """The feature pipeline, unfitted.
 
     Returned unfitted on purpose: the caller fits it per fold, so vocabularies
     and scaler statistics never see held-out films.
+
+    ``blocks`` selects which feature groups to build; see ``CATALOGUE_BLOCKS``.
     """
+    unknown = set(blocks) - set(FULL_BLOCKS)
+    if unknown:
+        raise ValueError(f"unknown feature block(s): {sorted(unknown)}")
+
+    definitions = {
+        "genres": (_text_pipeline(max_features=64), "genres"),
+        "keywords": (
+            _text_pipeline(max_features=6000, components=keyword_components),
+            "keywords",
+        ),
+        "directors": (_text_pipeline(max_features=1500), "directors"),
+        "cast": (_text_pipeline(max_features=3000), "cast"),
+        "countries": (_text_pipeline(max_features=120), "production_countries"),
+        # Natural language, so unlike the pre-joined columns it needs real word
+        # tokenisation, stop-word removal and dimensionality reduction.
+        "synopsis": (
+            TextBlock(
+                components=synopsis_components,
+                max_features=20000,
+                min_df=3,
+                stop_words="english",
+                ngram_range=(1, 2),
+                sublinear_tf=True,
+            ),
+            "synopsis",
+        ),
+        "numeric": (
+            Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())]),
+            NUMERIC_COLUMNS,
+        ),
+        "language": (
+            OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=5),
+            CATEGORICAL_COLUMNS,
+        ),
+    }
     return ColumnTransformer(
-        [
-            ("genres", _text_pipeline(max_features=64), "genres"),
-            (
-                "keywords",
-                _text_pipeline(max_features=6000, components=keyword_components),
-                "keywords",
-            ),
-            ("directors", _text_pipeline(max_features=1500), "directors"),
-            ("cast", _text_pipeline(max_features=3000), "cast"),
-            ("countries", _text_pipeline(max_features=120), "production_countries"),
-            # Natural language, so unlike the pre-joined columns it needs real
-            # word tokenisation, stop-word removal and dimensionality reduction.
-            (
-                "synopsis",
-                TextBlock(
-                    components=synopsis_components,
-                    max_features=20000,
-                    min_df=3,
-                    stop_words="english",
-                    ngram_range=(1, 2),
-                    sublinear_tf=True,
-                ),
-                "synopsis",
-            ),
-            (
-                "numeric",
-                Pipeline(
-                    [
-                        ("impute", SimpleImputer(strategy="median")),
-                        ("scale", StandardScaler()),
-                    ]
-                ),
-                NUMERIC_COLUMNS,
-            ),
-            (
-                "language",
-                OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=5),
-                CATEGORICAL_COLUMNS,
-            ),
-        ],
+        [(name, *definitions[name]) for name in blocks],
         remainder="drop",
         sparse_threshold=0.0,
     )

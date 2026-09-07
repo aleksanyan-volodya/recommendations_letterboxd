@@ -461,6 +461,16 @@ def evaluate_models(
         console.print(f"wrote {output}")
 
 
+@app.command()
+def dashboard() -> None:
+    """Launch the interactive Streamlit dashboard (plots, taste profile, model playground)."""
+    import subprocess
+    import sys
+
+    app_path = Path(__file__).parent / "dashboard" / "app.py"
+    subprocess.run([sys.executable, "-m", "streamlit", "run", str(app_path)])
+
+
 @app.command("resolve-apply")
 def resolve_apply() -> None:
     """Fold the reviewed unresolved.csv into the committed overrides file."""
