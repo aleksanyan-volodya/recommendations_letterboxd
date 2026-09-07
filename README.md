@@ -33,6 +33,94 @@ cp .env.example .env      # then fill in the TMDb token
 | Ingest the export | `uv run lbrec ingest` | `films_local`, `interactions`, `film_status` |
 | Resolve TMDb IDs | `uv run lbrec resolve` | `film_map`, `review/unresolved.csv` |
 | Fold in manual fixes | `uv run lbrec resolve-apply` | appends to `overrides/film_id_overrides.csv` |
+| Fetch TMDb metadata | `uv run lbrec enrich` | `films_tmdb` |
+| Prepare MovieLens | `uv run lbrec movielens` | `external/movielens/*.parquet` |
+| Report taste diagnostics | `uv run lbrec profile` | printed |
+| Cross-validate models | `uv run lbrec evaluate` | printed |
+| Interactive dashboard | `uv run lbrec dashboard` | Streamlit app |
+
+### Dashboard
+
+`uv run lbrec dashboard` (equivalently `uv run streamlit run src/lbrec/dashboard/app.py`)
+launches a local Streamlit app over whatever artifacts are already on disk:
+
+- **Overview** -- rating distribution, catalogue-vs-rated popularity, rating by
+  genre/decade, most-watched directors.
+- **Taste profile** -- the `lbrec profile` diagnostics (crowd-score and
+  popularity correlations, popularity deciles, tail share, watched-vs-wanted)
+  as charts.
+- **Model playground** -- cross-validate any combination of models with live
+  hyperparameter sliders (SVD components, XGBoost params, k in kNN, hybrid
+  inner folds, CV folds/repeats/seed), reproducing what `lbrec evaluate`
+  reports but interactively.
+- **Explore predictions** -- actual-vs-predicted scatter and largest misses for
+  one model from the last playground run, by title.
+
+It reads the parquet artifacts directly and computes nothing the pipeline
+doesn't already compute -- run `ingest`/`resolve`/`enrich` (and
+`movielens`/`factors` for the collaborative and hybrid models) first.
+
+### Evaluation
+
+`lbrec evaluate` runs k-fold cross-validation over one user's ratings and
+reports **every metric per popularity decile as well as overall**. That slice is
+the point: a model at RMSE 0.72 overall and 0.95 in the bottom deciles is
+failing at exactly what this project exists for, and the headline number hides
+it.
+
+Folds are random and seeded. A temporal split is not offered, because the only
+dates in a Letterboxd export are logging dates -- see the export traps above --
+so splitting on them would measure data-entry order, not taste over time.
+
+Models implement one interface (`fit(features, ratings)` / `predict(features)`),
+so a ridge, a factorisation or an LLM reranker are substitutions rather than
+rewrites. Every transformer is fitted inside the fold: with a few hundred labels,
+a vocabulary or scaler fitted over the whole set leaks and inflates every score.
+
+Two baselines are always included. `global_mean` is the floor. `crowd_score` --
+the crowd's average rating, rescaled to this user -- is the bar that matters: a
+personal model that cannot beat it has learned nothing personal.
+
+### The two legs, and two traps
+
+`content_ridge` works from TMDb metadata and covers every film.
+`collaborative_fold` (`lbrec factors`) holds MovieLens item factors fixed and
+solves only for the user's position in that space -- the cold-start-user fold-in,
+which is well determined by a few hundred ratings where learning a representation
+from them would not be. `hybrid` stacks the two.
+
+Both legs shipped with a bug that produced plausible output rather than an error.
+Each now has a regression test:
+
+1. **Item-centring removes the quality signal.** Ratings are centred per item
+   before factorisation so popularity does not dominate the components -- but
+   centring also removes *how well* a film is rated, which is the strongest
+   collaborative signal there is and the one `crowd_score` lives on. The item
+   mean must be carried alongside the latent directions. Restoring it moved the
+   collaborative leg from 0.848 to 0.745 RMSE on the reference data.
+2. **Stacking weights must be fitted out of fold.** Ridge fits its own training
+   fold far more closely than the collaborative leg fits its, so weights fitted
+   on in-sample predictions hand the ridge everything and the blend silently
+   collapses to one model. Weights come from an inner cross-validation.
+
+### Enrichment
+
+One request per title with genres, keywords, credits and external IDs appended,
+so the whole content feature set arrives in a single round trip. Two fields
+matter out of proportion to the rest:
+
+- **`imdb_id`** -- the join key to the IMDb bulk datasets and MovieLens
+  `links.csv`. Without it a title cannot be attached to any external data.
+- **`vote_count`** -- the popularity variable. Every debiasing technique in the
+  plan is a function of it, so it is a first-class column from the start.
+
+Film and TV payloads name the same ideas differently (`title`/`name`,
+`release_date`/`first_air_date`, keywords under `keywords`/`results`, directors
+vs `created_by`). Both are normalised onto one schema; `media_type` keeps them
+distinguishable.
+
+Note that list columns (`genres`, `keywords`, `cast`, ...) come back from
+parquet as numpy arrays rather than Python lists.
 
 ### ID resolution
 
@@ -142,6 +230,66 @@ films watched and rate them without keeping a diary. It is ingested because
 `rewatch` and real watch dates are free when present, but **nothing downstream
 may require it**. `coverage_report` prints per-kind coverage on every ingest so
 this stays visible when choosing features.
+
+## MovieLens
+
+`uv run lbrec movielens` converts the downloaded archive to parquet and measures
+what it covers. MovieLens substitutes for the user base this project does not
+have: 32M ratings from 200,948 users over 87,585 films (to October 2023).
+
+Download `ml-32m.zip` from <https://grouplens.org/datasets/movielens/> into
+`artifacts/external/`. Leave it zipped -- the loader reads the archive directly,
+so the pipeline stays reproducible from the original download. Note that
+`files.grouplens.org` has been serving an expired TLS certificate since 28
+August 2026, so a browser will warn before the download starts.
+
+**Licence: research use, free redistribution under the same terms, no commercial
+or revenue-bearing use without permission from GroupLens.** A free public site is
+within terms; anything revenue-bearing is not.
+
+`links.csv` has a trap: **MovieLens stores IMDb ids as bare integers with the
+`tt` prefix and leading zeros stripped**, so `114709` means `tt0114709`. Joining
+on the raw column matches nothing, silently. `imdb_tt()` restores them.
+
+### Presence is not signal
+
+The coverage report is deliberately sliced by popularity, because the headline
+number hides the thing that decides the architecture. A film can be *in*
+MovieLens and still carry no usable collaborative signal: an item with nine
+ratings out of 200k users yields a noise vector from any factorisation.
+
+So the report shows both coverage **and** median ratings per film per decile.
+Where median support collapses, the collaborative leg cannot serve those films
+and content features have to, which is what the hybrid design and its coverage
+gate exist for. Run it on your own export to find where that boundary falls.
+
+## Taste profile
+
+`uv run lbrec profile` reports how one user's ratings relate to catalogue
+popularity. These are **per-user quantities, not project constants** -- one
+person's watchlist is long and full of obscurities, another's is short and
+entirely mainstream, and the two need different handling -- so they are computed
+from whichever export is loaded rather than assumed.
+
+Three of them decide how modelling should go for that user:
+
+| quantity | what it decides |
+| --- | --- |
+| `rho(rating, crowd score)` | the real baseline. If a model cannot beat "predict what everyone else thought", it has learned nothing personal. |
+| `rho(rating, log vote_count)` | how much of this taste fame already explains. Near zero means a popularity-biased model is not merely suboptimal, it is wrong. |
+| tail share | whether the history has a long tail at all. If it all sits in the top deciles there is nothing to surface, and the debiasing work has no purchase. |
+
+The RMSE floor (predicting the user's mean) is also reported, but it is the easy
+bar; the crowd baseline is the one that matters.
+
+Deciles are cut against the **catalogue**, not against the user's own films, so
+"decile 1" means the same thing for everybody.
+
+`Watched versus wanted` compares the popularity of what a user has rated against
+what is still on their watchlist. Watchlists are usually assumed to be
+availability-biased toward well-known titles, but that is not universal, and
+which way it runs for a given user decides whether their watchlist is safe to
+use as a held-out positive set.
 
 ## Outputs
 
