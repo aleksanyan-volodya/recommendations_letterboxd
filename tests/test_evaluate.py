@@ -13,8 +13,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from lbrec.evaluate import cross_validate, evaluate, popularity_deciles, tail_summary
-from lbrec.features import build_film_features, neutralise_popularity
+from lbrec.catalogue import popularity_band
+from lbrec.evaluate import cross_validate, evaluate, tail_summary
+from lbrec.features import (
+    CROWD_PRIOR_MEAN,
+    build_film_features,
+    neutralise_popularity,
+    shrink_crowd_score,
+)
 from lbrec.models import ContentRidge, CrowdScore, GlobalMean
 
 
@@ -63,11 +69,37 @@ def test_crowd_score_learns_the_rescaling_rather_than_assuming_it():
     """A 0-10 crowd score does not map onto a 1-5 personal scale by division."""
     catalogue = make_catalogue(60)
     features = build_film_features(catalogue)
-    crowd = features["vote_average"].astype(float)
+    crowd = features["crowd_shrunk"].astype(float)
     ratings = 0.5 * crowd - 0.5  # an exact linear relationship
     model = CrowdScore().fit(features, ratings)
     assert model.slope_ == pytest.approx(0.5, abs=1e-6)
     assert model.predict(features) == pytest.approx(ratings.to_numpy(), abs=1e-6)
+
+
+def test_a_single_ten_out_of_ten_vote_is_shrunk_to_the_prior():
+    """The bug the first real recommendation run exposed.
+
+    3,093 catalogue films have exactly one vote of 10/10. Ranking on the raw
+    average put them at the top of the list ahead of everything else.
+    """
+    shrunk = shrink_crowd_score(pd.Series([10.0]), pd.Series([1]))
+    assert shrunk.iloc[0] < CROWD_PRIOR_MEAN + 0.1
+    # A genuinely well-liked film with real support keeps its score.
+    well_supported = shrink_crowd_score(pd.Series([8.0]), pd.Series([20_000]))
+    assert well_supported.iloc[0] == pytest.approx(8.0, abs=0.01)
+
+
+def test_no_votes_means_unknown_not_terrible():
+    """TMDb records vote_average as 0.0 for unrated films; 87k of them exist."""
+    shrunk = shrink_crowd_score(pd.Series([0.0, np.nan]), pd.Series([0, 0]))
+    assert shrunk.tolist() == pytest.approx([CROWD_PRIOR_MEAN, CROWD_PRIOR_MEAN])
+
+
+def test_shrinkage_is_monotone_in_support():
+    """More votes behind the same average means more of that average survives."""
+    scores = shrink_crowd_score(pd.Series([9.0] * 4), pd.Series([1, 10, 100, 10_000]))
+    assert scores.is_monotonic_increasing
+    assert scores.iloc[-1] > scores.iloc[0]
 
 
 def test_crowd_score_falls_back_when_a_film_has_no_crowd_score():
@@ -136,12 +168,31 @@ def test_each_row_is_predicted_by_a_model_that_never_saw_it(dataset):
     cross_validate([LeakDetector()], features, ratings, folds=5)
 
 
-def test_deciles_are_cut_against_the_catalogue(dataset):
-    features, _, catalogue = dataset
-    deciles = popularity_deciles(features["log_votes"].map(np.expm1), catalogue["vote_count"])
-    assert deciles.min() == 1
-    assert deciles.max() == 10
-    assert deciles.notna().all()
+def test_popularity_bands_are_absolute_not_quantiles():
+    """Bands must mean the same thing regardless of what set they are applied to.
+
+    Quantiles cut against a user's own library made "decile 1" mean "the least
+    popular film I have watched" -- which in the real catalogue is the top ~10%
+    of cinema. Absolute vote thresholds cannot drift like that.
+    """
+    votes = pd.Series([0, 3, 12, 50, 250, 1500, 5000, 50_000])
+    assert popularity_band(votes).tolist() == [
+        "0",
+        "1-4",
+        "5-19",
+        "20-99",
+        "100-499",
+        "500-2k",
+        "2k-10k",
+        "10k+",
+    ]
+    # Same inputs inside a much more popular set must land in the same bands.
+    bigger = pd.Series([0, 3, 12, 50, 250, 1500, 5000, 50_000] + [90_000] * 500)
+    assert popularity_band(bigger).head(8).tolist() == popularity_band(votes).tolist()
+
+
+def test_missing_vote_counts_are_treated_as_zero():
+    assert popularity_band(pd.Series([None, pd.NA])).tolist() == ["0", "0"]
 
 
 def test_evaluation_reports_every_model_overall_and_per_decile(dataset):
@@ -151,7 +202,7 @@ def test_evaluation_reports_every_model_overall_and_per_decile(dataset):
     )
     assert set(result.overall["model"]) == {"global_mean", "crowd_score"}
     assert set(result.by_decile["model"]) == {"global_mean", "crowd_score"}
-    assert result.by_decile["decile"].nunique() > 1
+    assert result.by_decile["band"].nunique() > 1
     assert (result.overall["n"] == len(features)).all()
 
 
@@ -167,12 +218,12 @@ def test_tail_summary_exposes_a_head_only_model(dataset):
     """A model good on famous films and bad on obscure ones must show a positive gap."""
     by_decile = pd.DataFrame(
         {
-            "model": ["m"] * 10,
-            "decile": range(1, 11),
-            "rmse": [1.5, 1.4, 1.3, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+            "model": ["m"] * 8,
+            "band": ["0", "1-4", "5-19", "20-99", "100-499", "500-2k", "2k-10k", "10k+"],
+            "rmse": [1.5, 1.4, 1.3, 1.4, 0.5, 0.5, 0.5, 0.5],
         }
     )
     summary = tail_summary(by_decile).set_index("model")
-    assert summary.loc["m", "rmse_tail"] == pytest.approx(1.4)
+    assert summary.loc["m", "rmse_tail"] == pytest.approx(1.4)  # mean of the four tail bands
     assert summary.loc["m", "rmse_head"] == pytest.approx(0.5)
     assert summary.loc["m", "gap"] > 0
