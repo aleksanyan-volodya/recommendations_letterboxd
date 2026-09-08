@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold
 
+from lbrec.catalogue import TAIL_BANDS, popularity_band
 from lbrec.models import Model
 from lbrec.profile import spearman
 
@@ -40,28 +41,6 @@ class Evaluation:
     overall: pd.DataFrame
     by_decile: pd.DataFrame
     predictions: pd.DataFrame
-
-
-def popularity_deciles(
-    votes: pd.Series, catalogue_votes: pd.Series, *, bins: int = 10
-) -> pd.Series:
-    """Place films in catalogue-wide popularity deciles.
-
-    Cut against the catalogue rather than the evaluated films so "decile 1"
-    means the same thing across models, users and runs.
-    """
-    edges = np.unique(
-        np.quantile(catalogue_votes.dropna().astype(float), np.linspace(0, 1, bins + 1))
-    )
-    if len(edges) < 3:
-        return pd.Series(pd.NA, index=votes.index, dtype="Int64")
-    # Clip before cutting. Popularity reaches here as log1p-then-expm1, whose
-    # rounding error can drop a film a hair below the lowest edge and silently
-    # turn it into a null decile. Clipping also gives a film more popular than
-    # anything in the catalogue the top decile rather than no decile at all.
-    values = votes.astype("Float64").astype(float).clip(edges[0], edges[-1])
-    placed = pd.cut(values, bins=edges, labels=range(1, len(edges)), include_lowest=True)
-    return placed.astype("Int64")
 
 
 def _metrics(actual: pd.Series, predicted: pd.Series) -> dict[str, float | None]:
@@ -147,8 +126,10 @@ def evaluate(
             progress.update(1)
     predictions = pd.concat(frames, ignore_index=True)
 
-    deciles = popularity_deciles(features["log_votes"].map(np.expm1), catalogue_votes)
-    predictions["decile"] = predictions["row"].map(deciles)
+    # Absolute popularity bands, not quantiles of whatever set happens to be
+    # passed in -- see catalogue.POPULARITY_BANDS.
+    bands = popularity_band(features["log_votes"].map(np.expm1))
+    predictions["band"] = predictions["row"].map(bands)
 
     per_repeat = (
         predictions.groupby(["model", "repeat"], sort=False)
@@ -170,22 +151,24 @@ def evaluate(
     overall["rmse_sd"] = overall["rmse_sd"].fillna(0.0)
 
     by_decile = (
-        predictions.dropna(subset=["decile"])
-        .groupby(["model", "decile"], sort=False, observed=True)
+        predictions.dropna(subset=["band"])
+        .groupby(["model", "band"], sort=False, observed=True)
         .apply(lambda g: pd.Series(_metrics(g["actual"], g["predicted"])), include_groups=False)
         .reset_index()
     )
     return Evaluation(overall=overall, by_decile=by_decile, predictions=predictions)
 
 
-def tail_summary(by_decile: pd.DataFrame, *, tail_deciles: int = 3) -> pd.DataFrame:
+def tail_summary(
+    by_decile: pd.DataFrame, *, tail_bands: tuple[str, ...] = TAIL_BANDS
+) -> pd.DataFrame:
     """Head-versus-tail RMSE per model, and the gap between them.
 
     The gap is the number to watch. A model that is only good on famous films
     has not solved this problem, however strong its overall score.
     """
     frame = by_decile.dropna(subset=["rmse"]).copy()
-    frame["band"] = np.where(frame["decile"] <= tail_deciles, "tail", "head")
+    frame["band"] = np.where(frame["band"].isin(tail_bands), "tail", "head")
     pivot = (
         frame.pivot_table(index="model", columns="band", values="rmse", aggfunc="mean")
         .reset_index()

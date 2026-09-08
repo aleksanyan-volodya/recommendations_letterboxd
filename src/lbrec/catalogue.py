@@ -163,23 +163,55 @@ def exclude_seen(catalogue: pd.DataFrame, seen_tmdb_ids: set[int]) -> pd.DataFra
     return catalogue[~ids.isin(seen_tmdb_ids)].reset_index(drop=True)
 
 
-def catalogue_report(catalogue: pd.DataFrame, *, bins: int = 10) -> pd.DataFrame:
-    """Popularity deciles of the real catalogue.
+#: Popularity bands, as absolute vote counts rather than quantiles.
+#:
+#: Quantiles do not work on the real catalogue: 87k of 273k films have exactly
+#: zero votes, so the bottom four "deciles" are all the same number and the
+#: quantile edges collapse into each other. Worse, quantile bands shift with
+#: whatever set they were cut against -- which is how "decile 1" came to mean
+#: "the least popular film in my own library" (roughly the top 10% of cinema)
+#: rather than anything about obscurity.
+#:
+#: Absolute bands are stable across users, datasets and time, and each one means
+#: something a person can state: "nobody has rated this" is a real category in a
+#: way that "decile 3" is not.
+POPULARITY_BANDS: tuple[tuple[int, float, str], ...] = (
+    (0, 0, "0"),
+    (1, 4, "1-4"),
+    (5, 19, "5-19"),
+    (20, 99, "20-99"),
+    (100, 499, "100-499"),
+    (500, 1999, "500-2k"),
+    (2000, 9999, "2k-10k"),
+    (10000, float("inf"), "10k+"),
+)
 
-    These are the boundaries every later popularity claim should be measured
-    against. Cutting them against a user's own library instead -- which is what
-    happened before this module existed -- makes "decile 1" mean something
-    entirely different and much less obscure.
+BAND_LABELS: tuple[str, ...] = tuple(label for _, _, label in POPULARITY_BANDS)
+
+#: Bands treated as "long tail" when summarising head-versus-tail performance.
+TAIL_BANDS: tuple[str, ...] = ("0", "1-4", "5-19", "20-99")
+
+
+def popularity_band(votes: pd.Series) -> pd.Series:
+    """Bucket vote counts into ordered, absolute popularity bands.
+
+    Missing vote counts are treated as zero: for a catalogue built from a crowd
+    dump, "no recorded votes" and "zero votes" mean the same thing.
     """
-    votes = catalogue["vote_count"].dropna().astype(float)
-    if votes.empty:
-        return pd.DataFrame(columns=["decile", "films", "votes_min", "votes_max"])
+    values = pd.to_numeric(votes, errors="coerce").astype("Float64").astype(float).fillna(0.0)
+    edges = [-0.5] + [high + 0.5 for _, high, _ in POPULARITY_BANDS[:-1]] + [float("inf")]
+    return pd.cut(values, bins=edges, labels=list(BAND_LABELS), ordered=True)
 
-    labels = pd.qcut(votes.rank(method="first"), q=bins, labels=range(1, bins + 1))
-    return (
-        pd.DataFrame({"decile": labels, "votes": votes})
-        .groupby("decile", observed=True)
-        .agg(films=("votes", "size"), votes_min=("votes", "min"), votes_max=("votes", "max"))
-        .reset_index()
-        .astype({"votes_min": int, "votes_max": int})
-    )
+
+def catalogue_report(catalogue: pd.DataFrame) -> pd.DataFrame:
+    """Distribution of the catalogue across popularity bands.
+
+    This is the reference every later popularity claim should be read against.
+    """
+    if catalogue.empty:
+        return pd.DataFrame(columns=["band", "films", "share"])
+
+    bands = popularity_band(catalogue["vote_count"])
+    report = bands.value_counts().rename_axis("band").reset_index(name="films").sort_values("band")
+    report["share"] = (report["films"] / len(catalogue)).map("{:.1%}".format)
+    return report.reset_index(drop=True)

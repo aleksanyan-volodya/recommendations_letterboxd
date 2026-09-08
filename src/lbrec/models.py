@@ -23,6 +23,7 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 
 from lbrec.features import (
+    FULL_BLOCKS,
     KEYWORD_COMPONENTS,
     SYNOPSIS_COMPONENTS,
     build_preprocessor,
@@ -63,6 +64,9 @@ class CrowdScore:
     onto a 1-5 personal scale by simple division, because users differ in both
     generosity and spread. Films without a crowd score fall back to the mean.
 
+    Uses the *shrunk* crowd score: the raw average is meaningless for a film
+    with one vote, and this baseline would otherwise inherit that pathology.
+
     **This is the baseline to beat.** It uses no personal information beyond two
     calibration constants.
     """
@@ -74,7 +78,7 @@ class CrowdScore:
         self.intercept_ = 3.0
 
     def fit(self, features: pd.DataFrame, ratings: pd.Series) -> CrowdScore:
-        crowd = pd.to_numeric(features["vote_average"], errors="coerce").astype(float)
+        crowd = pd.to_numeric(features["crowd_shrunk"], errors="coerce").astype(float)
         usable = crowd.notna() & (crowd > 0) & ratings.notna()
         self.intercept_ = float(ratings.mean())
         if usable.sum() >= 3 and crowd[usable].std() > 0:
@@ -84,7 +88,7 @@ class CrowdScore:
         return self
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
-        crowd = pd.to_numeric(features["vote_average"], errors="coerce").astype(float)
+        crowd = pd.to_numeric(features["crowd_shrunk"], errors="coerce").astype(float)
         predictions = self.slope_ * crowd + self.intercept_
         return np.where(crowd.notna() & (crowd > 0), predictions, self.intercept_)
 
@@ -109,10 +113,12 @@ class ContentRidge:
         debias: bool = False,
         keyword_components: int = KEYWORD_COMPONENTS,
         synopsis_components: int = SYNOPSIS_COMPONENTS,
+        blocks: tuple[str, ...] = FULL_BLOCKS,
     ) -> None:
         self.debias = debias
         self.keyword_components = keyword_components
         self.synopsis_components = synopsis_components
+        self.blocks = blocks
         self.name = "content_ridge_debiased" if debias else "content_ridge"
         self.pipeline_: Pipeline | None = None
         self.train_features_: pd.DataFrame | None = None
@@ -125,6 +131,7 @@ class ContentRidge:
                     build_preprocessor(
                         keyword_components=self.keyword_components,
                         synopsis_components=self.synopsis_components,
+                        blocks=self.blocks,
                     ),
                 ),
                 ("ridge", RidgeCV(alphas=np.logspace(-1, 3.5, 24))),
@@ -168,7 +175,9 @@ class GradientBoosted:
         reg_lambda: float = 2.0,
         keyword_components: int = KEYWORD_COMPONENTS,
         synopsis_components: int = SYNOPSIS_COMPONENTS,
+        blocks: tuple[str, ...] = FULL_BLOCKS,
     ) -> None:
+        self.blocks = blocks
         self.params = {
             "n_estimators": n_estimators,
             "max_depth": max_depth,
@@ -192,6 +201,7 @@ class GradientBoosted:
                     build_preprocessor(
                         keyword_components=self.keyword_components,
                         synopsis_components=self.synopsis_components,
+                        blocks=self.blocks,
                     ),
                 ),
                 (
@@ -236,7 +246,9 @@ class ContentKNN:
         n_neighbors: int = 25,
         keyword_components: int = KEYWORD_COMPONENTS,
         synopsis_components: int = SYNOPSIS_COMPONENTS,
+        blocks: tuple[str, ...] = FULL_BLOCKS,
     ) -> None:
+        self.blocks = blocks
         self.n_neighbors = n_neighbors
         self.keyword_components = keyword_components
         self.synopsis_components = synopsis_components
@@ -252,6 +264,7 @@ class ContentKNN:
                     build_preprocessor(
                         keyword_components=self.keyword_components,
                         synopsis_components=self.synopsis_components,
+                        blocks=self.blocks,
                     ),
                 ),
                 (

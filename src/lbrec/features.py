@@ -29,7 +29,50 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 #: Columns of list type that become bag-of-words documents.
 LIST_COLUMNS = ("genres", "keywords", "directors", "cast", "production_countries")
 
-NUMERIC_COLUMNS = ["year", "runtime", "log_votes", "vote_average"]
+NUMERIC_COLUMNS = ["year", "runtime", "log_votes", "crowd_shrunk"]
+
+#: Prior for shrinking the crowd score, measured from films with >=100 votes.
+CROWD_PRIOR_MEAN = 6.5
+
+#: How many votes of evidence the prior is worth. A film needs roughly this many
+#: votes before its own average outweighs the prior.
+CROWD_PRIOR_WEIGHT = 50.0
+
+
+def shrink_crowd_score(
+    vote_average: pd.Series,
+    vote_count: pd.Series,
+    *,
+    prior_mean: float = CROWD_PRIOR_MEAN,
+    prior_weight: float = CROWD_PRIOR_WEIGHT,
+) -> pd.Series:
+    """Crowd score shrunk toward the global mean by how many votes back it.
+
+    ``vote_average`` is unusable raw. In the real catalogue 3,093 films have a
+    single vote of 10/10, and 87,151 have no votes at all -- where TMDb records
+    the average as 0.0, which a model reads as "terrible" rather than "unknown".
+    Ranking on the raw column therefore surfaces films that exactly one person
+    has ever rated, which is what the first recommendation run actually did.
+
+    Cross-validation could not have caught this: every film in a user's library
+    has thousands of votes, so the pathology only exists in the catalogue. It is
+    the clearest example of why offline metrics on self-selected films do not
+    transfer to the population we recommend from.
+
+    The standard weighted-rating formula::
+
+        (v * R + m * C) / (v + m)
+
+    With no votes it returns the prior exactly, and with many votes it returns
+    the film's own average.
+    """
+    votes = pd.to_numeric(vote_count, errors="coerce").astype("Float64").astype(float).fillna(0.0)
+    average = pd.to_numeric(vote_average, errors="coerce").astype("Float64").astype(float)
+    # A recorded average of 0 alongside 0 votes means "unknown", not "zero".
+    average = average.fillna(prior_mean)
+    return (votes * average + prior_weight * prior_mean) / (votes + prior_weight)
+
+
 CATEGORICAL_COLUMNS = ["original_language"]
 
 #: Keyword space is large (8k+ distinct terms against a few hundred films), so
@@ -70,6 +113,9 @@ def build_film_features(films: pd.DataFrame) -> pd.DataFrame:
     frame["vote_average"] = pd.to_numeric(films.get("vote_average"), errors="coerce").astype(
         "Float64"
     )
+    # The usable form of the crowd score. See shrink_crowd_score for why the raw
+    # column cannot be ranked on.
+    frame["crowd_shrunk"] = shrink_crowd_score(frame["vote_average"], votes)
     frame["original_language"] = films.get(
         "original_language", pd.Series(index=films.index)
     ).fillna("unknown")

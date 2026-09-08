@@ -155,6 +155,16 @@ class Settings:
         return self.processed_dir / "movielens_item_factors.parquet"
 
     @property
+    def letterboxd_zip(self) -> Path:
+        """The Letterboxd crowd dump, used as the catalogue skeleton."""
+        return self.external_dir / "letterboxd-samlearner.zip"
+
+    @property
+    def catalogue_path(self) -> Path:
+        """Every film we are allowed to recommend. Shared across users."""
+        return self.processed_dir / "catalogue.parquet"
+
+    @property
     def films_tmdb_path(self) -> Path:
         """TMDb metadata, one row per resolved title."""
         return self.processed_dir / "films_tmdb.parquet"

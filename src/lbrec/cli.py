@@ -14,10 +14,11 @@ from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
 
+from lbrec.catalogue import catalogue_report, exclude_seen, merge_known_films, read_letterboxd_dump
 from lbrec.config import get_settings
 from lbrec.enrich import enrich_films, popularity_report
 from lbrec.evaluate import evaluate, tail_summary
-from lbrec.features import build_film_features
+from lbrec.features import CATALOGUE_BLOCKS, build_film_features
 from lbrec.letterboxd import coverage_report, film_status, load_export
 from lbrec.models import (
     CONTENT_ONLY,
@@ -28,6 +29,7 @@ from lbrec.models import (
 )
 from lbrec.movielens import build_item_factors, coverage_by_popularity, link_films, load, prepare
 from lbrec.profile import build_profile, popularity_gap
+from lbrec.recommend import RANK_MODES, RANK_PLAIN, recommend, summarise_popularity
 from lbrec.resolve import (
     OVERRIDE,
     REVIEW_CONFIDENCES,
@@ -369,6 +371,112 @@ def list_models() -> None:
             "[yellow]item factors absent: run `lbrec factors` to enable the "
             "collaborative models[/yellow]"
         )
+
+
+@app.command()
+def catalogue(
+    archive: Path | None = typer.Option(None, help="Letterboxd crowd dump zip."),
+) -> None:
+    """Build the candidate catalogue: every film we are allowed to recommend."""
+    settings = get_settings()
+    settings.ensure_dirs()
+    zip_path = archive or settings.letterboxd_zip
+    if not zip_path.exists():
+        raise typer.BadParameter(f"{zip_path} not found.")
+
+    console.print(f"reading {zip_path.name} (a few hundred rows are malformed and get skipped)...")
+    films = read_letterboxd_dump(zip_path)
+    console.print(
+        f"[bold]{len(films):,}[/bold] films with a TMDb id "
+        f"({films.attrs['skipped_rows']:,} rows skipped)"
+    )
+
+    if settings.films_tmdb_path.exists():
+        enriched = pd.read_parquet(settings.films_tmdb_path)
+        films = merge_known_films(films, enriched)
+        console.print(f"overlaid {int(films['enriched'].sum()):,} fully enriched films")
+
+    films.to_parquet(settings.catalogue_path, index=False)
+    _render(catalogue_report(films), "Catalogue by popularity decile (the REAL reference)")
+    console.print(f"wrote {settings.catalogue_path.relative_to(settings.artifacts_dir.parent)}")
+    console.print(
+        "[dim]Not filtered by popularity on purpose: trimming to well-voted films would "
+        "make obscure films unrecommendable by construction.[/dim]"
+    )
+
+
+@app.command("recommend")
+def recommend_films(
+    user: str | None = typer.Option(None, help="Who to recommend for (default: 'me')."),
+    model: str = typer.Option("content_ridge", help="Model name. See `lbrec models`."),
+    k: int = typer.Option(20, help="How many films to return."),
+    mode: str = typer.Option(RANK_PLAIN, help=f"Ranking mode: {', '.join(RANK_MODES)}."),
+    tail_share: float = typer.Option(0.4, help="calibrated mode: target share of long-tail films."),
+    output: Path | None = typer.Option(None, help="Write the full ranked list to this CSV."),
+) -> None:
+    """Recommend films from the catalogue."""
+    settings = get_settings()
+    paths = settings.user(user)
+    for path in (paths.film_status, settings.film_map_path, settings.films_tmdb_path):
+        if not path.exists():
+            raise typer.BadParameter(f"{path} not found. Run ingest, resolve and enrich first.")
+    if not settings.catalogue_path.exists():
+        raise typer.BadParameter("catalogue not built. Run `lbrec catalogue` first.")
+
+    status = pd.read_parquet(paths.film_status)
+    film_map = pd.read_parquet(settings.film_map_path)
+    enriched = pd.read_parquet(settings.films_tmdb_path)
+    catalogue_films = pd.read_parquet(settings.catalogue_path)
+
+    rated = (
+        film_map[film_map["tmdb_id"].notna()][["film_key", "tmdb_id"]]
+        .merge(status[["film_key", "rating", "seen"]], on="film_key")
+        .merge(enriched, on="tmdb_id")
+        .dropna(subset=["rating"])
+        .drop_duplicates("tmdb_id")
+        .reset_index(drop=True)
+    )
+    seen_ids = set(
+        film_map.merge(status[["film_key", "seen"]], on="film_key")
+        .query("seen == True")["tmdb_id"]
+        .dropna()
+        .astype("int64")
+    )
+    before = len(catalogue_films)
+    candidates = exclude_seen(catalogue_films, seen_ids)
+
+    try:
+        scorer = build_model(model)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    # Retrain on the intersection of features the catalogue also has.
+    if hasattr(scorer, "blocks"):
+        scorer.blocks = CATALOGUE_BLOCKS
+
+    console.print(
+        f"scoring [bold]{len(candidates):,}[/bold] candidates "
+        f"({before - len(candidates):,} excluded as already seen) "
+        f"with [bold]{model}[/bold], mode={mode}"
+    )
+    result = recommend(
+        scorer,
+        build_film_features(rated),
+        rated["rating"].astype(float),
+        candidates,
+        k=k,
+        mode=mode,
+        tail_share=tail_share,
+    )
+    _render(result.films, f"Top {k} for {paths.user} ({mode})")
+    _render(summarise_popularity(result.films), "Where these sit on the popularity axis")
+    console.print(
+        "[dim]Retrieval only: the catalogue has no keywords, cast or crew, so the model "
+        "was trained on the reduced feature set those films share.[/dim]"
+    )
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        result.films.to_csv(output, index=False)
+        console.print(f"wrote {output}")
 
 
 @app.command("evaluate")
