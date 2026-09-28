@@ -344,3 +344,397 @@ def test_learned_weights_are_global_not_per_user():
     before = model.weights_.copy()
     model.score_user(np.arange(20), np.full(20, 4.0), np.arange(30))
     assert np.array_equal(before, model.weights_)
+
+
+# --------------------------------------------------------------------------
+# item-bias strategies and the cold-item protocol
+# --------------------------------------------------------------------------
+def test_unknown_item_bias_strategies_disagree_about_unrated_films():
+    """The three strategies must actually be three different models.
+
+    ``known`` pins an unrated film to the global mean, ``none`` refuses the term
+    for every film, and ``predicted`` infers one from content. The differences
+    only show on a candidate set that mixes rated and unrated films, which is
+    why the cold-item protocol scores them together.
+    """
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=120, n_items=60, seed=11)
+    features = make_item_features(n_items=120, n_dims=6)  # 60 films nobody rated
+    targets = np.arange(120)  # rated and unrated competing in one ranking
+    unrated = targets >= 60
+    given_items, given_values = np.arange(10), np.full(10, 4.0)
+
+    scored = {}
+    for strategy in ("known", "none", "predicted"):
+        model = ContentTower(
+            features, item_bias=strategy, learn_weights=False, bias_reg=0.1
+        ).fit_global(ratings)
+        scored[strategy] = model.score_user(given_items, given_values, targets)
+
+    for left, right in (("known", "none"), ("known", "predicted"), ("none", "predicted")):
+        assert not np.allclose(scored[left], scored[right]), f"{left} and {right} agree"
+
+    # `known` gives every unrated film the same b_i (zero); `predicted` must not.
+    assert np.allclose(scored["known"][unrated], scored["none"][unrated])
+    assert (scored["predicted"][unrated] - scored["none"][unrated]).std() > 0
+
+
+def test_missing_bias_strategies_cannot_differ_on_cold_films_alone():
+    """The finding that shaped the protocol, pinned so it cannot be forgotten.
+
+    On a candidate set of *only* crowd-less films, `known` and `none` are the
+    same model. An experiment that scored cold films in isolation would compare
+    them and correctly report no difference, which would be a true number and a
+    false conclusion.
+    """
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=120, n_items=60, seed=17)
+    features = make_item_features(n_items=120, n_dims=6)
+    unrated = np.arange(60, 120)
+    history, values = np.arange(10), np.full(10, 4.0)
+
+    scores = [
+        ContentTower(features, item_bias=strategy, learn_weights=False)
+        .fit_global(ratings)
+        .score_user(history, values, unrated)
+        for strategy in ("known", "none")
+    ]
+    assert np.allclose(*scores)
+
+
+def test_predicted_item_bias_is_learned_from_rated_films_only():
+    """Fitting it on unrated films would be fitting on zeros it invented."""
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=120, n_items=60, seed=12)
+    features = make_item_features(n_items=120, n_dims=6)
+    model = ContentTower(features, item_bias="predicted", learn_weights=False).fit_global(ratings)
+
+    assert model.bias_weights_ is not None
+    # A film the crowd rated keeps its measured bias, never the predicted one.
+    rated = np.array([3])
+    measured = model.global_mean_ + float(model.item_bias_.loc[3])
+    assert model._baseline(rated)[0] == pytest.approx(measured, abs=1e-5)
+
+
+def test_item_bias_none_ignores_crowd_quality_when_ranking_candidates():
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=80, n_items=60, seed=13)
+    model = ContentTower(
+        make_item_features(n_items=60), item_bias="none", learn_weights=False
+    ).fit_global(ratings)
+    assert np.allclose(model._baseline(np.arange(60)), model.global_mean_)
+
+
+def test_item_bias_none_still_uses_the_crowd_to_read_the_history():
+    """Withholding `b_i` is a ranking decision, not a profile decision.
+
+    Without it, a user who rates an acclaimed film 5 looks enthusiastic rather
+    than ordinary, and their taste vector drifts toward whatever is merely good.
+    """
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=80, n_items=60, seed=18)
+    model = ContentTower(
+        make_item_features(n_items=60), item_bias="none", learn_weights=False
+    ).fit_global(ratings)
+
+    history = np.arange(30)
+    assert not np.allclose(model._history_baseline(history), model.global_mean_)
+    expected = model.global_mean_ + model.item_bias_.loc[history].to_numpy()
+    assert model._history_baseline(history) == pytest.approx(expected, abs=1e-5)
+
+
+def test_unknown_item_bias_strategy_is_rejected():
+    from lbrec.generalise import ContentTower
+
+    with pytest.raises(ValueError, match="item_bias"):
+        ContentTower(make_item_features(n_items=10), item_bias="popularity")
+
+
+def test_cold_items_are_hidden_from_the_global_fit():
+    """The point of the protocol: the model must not know the cold films.
+
+    If a cold film's ratings reached the item-bias table, the evaluation would
+    measure memorisation of exactly the films it claims are unknown.
+    """
+    from lbrec.generalise import ContentTower, cold_item_split, evaluate_cold_items
+
+    ratings = make_ratings(n_users=120, n_items=90, seed=14)
+    split = split_users(ratings, n_test_users=20, min_ratings=20, seed=0)
+    cold = cold_item_split(ratings, share=0.2, seed=0)
+    features = make_item_features(n_items=90, n_dims=6)
+
+    model = ContentTower(features, learn_weights=False)
+    per_user = evaluate_cold_items([model], ratings, split, cold, given_sizes=(10,), seed=0)
+
+    assert not per_user.empty
+    assert not set(model.item_bias_.index) & set(cold.tolist())
+
+
+def test_cold_item_scoring_never_shows_a_cold_film_in_the_history():
+    """A user's own rating of a cold film would leak the answer into the input."""
+    from lbrec.generalise import cold_item_split, evaluate_cold_items
+
+    ratings = make_ratings(n_users=120, n_items=90, seed=15)
+    split = split_users(ratings, n_test_users=20, min_ratings=20, seed=0)
+    cold = set(cold_item_split(ratings, share=0.3, seed=0).tolist())
+
+    seen_histories: list[np.ndarray] = []
+
+    class Spy:
+        name = "spy"
+
+        def fit_global(self, ratings):
+            return self
+
+        def score_user(self, given_items, given_ratings, target_items):
+            seen_histories.append(np.asarray(given_items))
+            return np.full(len(target_items), 3.5)
+
+    evaluate_cold_items([Spy()], ratings, split, np.array(sorted(cold)), given_sizes=(10,), seed=0)
+
+    assert seen_histories
+    for history in seen_histories:
+        assert not set(history.tolist()) & cold
+
+
+def test_cold_item_split_only_picks_films_with_enough_ratings():
+    """A cold film with two ratings gives an RMSE that is mostly noise."""
+    from lbrec.generalise import cold_item_split
+
+    ratings = make_ratings(n_users=60, n_items=200, seed=16)
+    support = ratings["movieId"].value_counts()
+    cold = cold_item_split(ratings, share=0.5, seed=0, min_ratings=5)
+    assert (support.loc[cold] >= 5).all()
+
+
+def test_tail_share_detects_a_model_that_suppresses_crowd_less_films():
+    """The fairness metric must react to the bias it is there to catch.
+
+    A model that adds a bonus to every well-known film should fill the top of the
+    list with them, pushing `tail_share` below what the user's own ratings say it
+    should be.
+    """
+    from lbrec.generalise import _ranking_metrics
+
+    is_cold = np.array([True] * 10 + [False] * 10)
+    actual = np.array([5.0] * 10 + [2.0] * 10)  # the user loved the cold films
+
+    fair = _ranking_metrics(actual, actual.copy(), is_cold, k=10)
+    assert fair["tail_share"] == pytest.approx(1.0)
+    assert fair["tail_share_actual"] == pytest.approx(1.0)
+
+    famous_bonus = actual + np.where(is_cold, 0.0, 4.0)  # enough to invert the order
+    biased = _ranking_metrics(actual, famous_bonus, is_cold, k=10)
+    assert biased["tail_share"] == pytest.approx(0.0)
+    assert biased["tail_share_actual"] == pytest.approx(1.0)
+
+
+def test_top_k_ties_are_not_broken_in_favour_of_older_films():
+    """MovieLens rows arrive movieId-ordered, and movieId tracks release year.
+
+    With every prediction identical, `argsort` alone would hand the whole top ten
+    to whichever films happen to come first -- reporting a confident tail share
+    that is really just row order.
+    """
+    from lbrec.generalise import _ranking_metrics
+
+    is_cold = np.array([True] * 50 + [False] * 50)
+    flat = np.full(100, 3.5)
+    share = _ranking_metrics(flat, flat, is_cold, k=10)["tail_share"]
+    assert 0.0 < share < 1.0
+
+
+def test_bias_weight_traces_the_frontier_between_the_two_corners():
+    """`bias_weight` must interpolate, with its ends matching the named strategies.
+
+    At 0 the crowd term is gone, so the ranking must match `item_bias="none"`;
+    at 1 nothing is discounted. In between the crowd's influence shrinks
+    monotonically, which is what makes the curve a usable knob rather than a
+    third arbitrary setting.
+    """
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=120, n_items=60, seed=19)
+    features = make_item_features(n_items=120, n_dims=6)
+    targets = np.arange(120)
+    history, values = np.arange(10), np.full(10, 4.0)
+
+    def scored(**kwargs):
+        model = ContentTower(features, learn_weights=False, **kwargs).fit_global(ratings)
+        return model.score_user(history, values, targets)
+
+    fair = scored(item_bias="none")
+    damped_out = scored(item_bias="predicted", bias_weight=0.0)
+    assert np.allclose(fair, damped_out)
+
+    # The crowd's contribution must shrink as the weight falls.
+    full = scored(item_bias="predicted", bias_weight=1.0)
+    half = scored(item_bias="predicted", bias_weight=0.5)
+    crowd_full = np.abs(full - fair).mean()
+    crowd_half = np.abs(half - fair).mean()
+    assert crowd_half < crowd_full
+    assert crowd_half == pytest.approx(crowd_full / 2, rel=1e-5)
+
+
+def test_bias_weight_shows_up_in_the_model_name():
+    """Sweep rows are useless if every point reports as the same model."""
+    from lbrec.generalise import ContentTower
+
+    features = make_item_features(n_items=20)
+    assert ContentTower(features, item_bias="predicted").name == "tower_predicted"
+    assert (
+        ContentTower(features, item_bias="predicted", bias_weight=0.25).name
+        == "tower_predicted_b0.25"
+    )
+
+
+# --------------------------------------------------------------------------
+# the objective
+# --------------------------------------------------------------------------
+def _frontier_rows(rows: list[dict]) -> pd.DataFrame:
+    """Per-user records shaped like the cold-item protocol's output."""
+    return pd.DataFrame(
+        [
+            {
+                "model": model,
+                "n_given": 25,
+                "userId": user,
+                "spearman": spearman,
+                "tail_share": tail,
+                "tail_share_actual": 0.30,
+            }
+            for model, spearman, tail in rows
+            for user in range(20)
+        ]
+    )
+
+
+def test_objective_rejects_an_accurate_model_that_suppresses_the_tail():
+    """The constraint comes first: ranking well is not a licence to hide films."""
+    from lbrec.generalise import frontier
+
+    per_user = _frontier_rows(
+        [("suppressor", 0.40, 0.05), ("fair_but_weak", 0.10, 0.30), ("fair_and_good", 0.30, 0.29)]
+    )
+    verdict = frontier(per_user)
+    picked = verdict[verdict["best"]]["model"].tolist()
+    assert picked == ["fair_and_good"]
+    assert not verdict.set_index("model").loc["suppressor", "fair"]
+
+
+def test_objective_prefers_the_best_ranking_among_the_fair_models():
+    from lbrec.generalise import frontier
+
+    per_user = _frontier_rows([("fair_weak", 0.12, 0.30), ("fair_strong", 0.25, 0.28)])
+    verdict = frontier(per_user)
+    assert verdict[verdict["best"]]["model"].tolist() == ["fair_strong"]
+
+
+def test_objective_reports_overshooting_without_rewarding_it():
+    """Showing obscure films more than they deserve is a different product.
+
+    It is not disqualified -- it clears the bar -- but it must not beat a model
+    that is both fair and ranks better, and the fairness ratio has to make the
+    overshoot visible rather than hide it at 1.0.
+    """
+    from lbrec.generalise import frontier
+
+    per_user = _frontier_rows([("overshooter", 0.15, 0.60), ("fair_and_good", 0.30, 0.29)])
+    verdict = frontier(per_user).set_index("model")
+    assert verdict.loc["overshooter", "fair"]
+    assert verdict.loc["overshooter", "fairness"] == pytest.approx(2.0)
+    assert not verdict.loc["overshooter", "best"]
+
+
+def test_objective_marks_nothing_when_no_model_is_fair():
+    """Silence beats a false winner: it is the signal to change architecture."""
+    from lbrec.generalise import frontier
+
+    verdict = frontier(_frontier_rows([("a", 0.40, 0.05), ("b", 0.35, 0.02)]))
+    assert not verdict["best"].any()
+    assert not verdict["fair"].any()
+
+
+def test_objective_needs_the_cold_item_columns():
+    from lbrec.generalise import frontier
+
+    with pytest.raises(ValueError, match="tail_share"):
+        frontier(pd.DataFrame({"model": ["x"], "n_given": [10], "spearman": [0.2]}))
+
+
+# --------------------------------------------------------------------------
+# stratified ranking
+# --------------------------------------------------------------------------
+def test_interleaving_holds_each_group_at_its_own_rate():
+    """The fairness guarantee, by construction rather than by tuning."""
+    from lbrec.generalise import _interleave
+
+    # 30 crowd-less films and 70 known ones; the known ones score far higher, so
+    # any direct comparison would bury the tail completely.
+    known = np.array([False] * 30 + [True] * 70)
+    scores = np.where(known, 5.0, 2.0) + np.linspace(0, 0.5, 100)
+
+    ranked = _interleave(scores, known)
+    top_ten = np.argsort(-ranked)[:10]
+    assert 0.2 <= (~known[top_ten]).mean() <= 0.4, "top ten did not match the 30% base rate"
+
+
+def test_interleaving_keeps_the_full_model_order_inside_each_group():
+    """Fairness must not cost ranking power where the comparison is valid."""
+    from lbrec.generalise import _interleave
+
+    known = np.array([False, False, False, True, True, True])
+    scores = np.array([1.0, 3.0, 2.0, 10.0, 30.0, 20.0])
+    ranked = _interleave(scores, known)
+
+    for member in (known, ~known):
+        index = np.flatnonzero(member)
+        by_score = index[np.argsort(-scores[index])]
+        by_rank = index[np.argsort(-ranked[index])]
+        assert list(by_score) == list(by_rank)
+
+
+def test_interleaving_survives_a_group_being_empty():
+    from lbrec.generalise import _interleave
+
+    scores = np.array([1.0, 3.0, 2.0])
+    ranked = _interleave(scores, np.array([True, True, True]))
+    assert list(np.argsort(-ranked)) == list(np.argsort(-scores))
+
+
+def test_stratified_ranker_still_predicts_calibrated_ratings():
+    """Ranking by an interleaved position must not corrupt the prediction.
+
+    RMSE has to stay comparable with the underlying tower, or the fairness fix
+    would look like an accuracy regression that it is not.
+    """
+    from lbrec.generalise import ContentTower, StratifiedRanker
+
+    ratings = make_ratings(n_users=120, n_items=60, seed=20)
+    features = make_item_features(n_items=120, n_dims=6)
+    tower = ContentTower(features, item_bias="predicted", learn_weights=False)
+    model = StratifiedRanker(tower).fit_global(ratings)
+
+    history, values, targets = np.arange(10), np.full(10, 4.0), np.arange(120)
+    assert np.allclose(
+        model.score_user(history, values, targets),
+        tower.score_user(history, values, targets),
+    )
+    ranked = model.rank_user(history, values, targets)
+    assert not np.allclose(ranked, model.score_user(history, values, targets))
+
+
+def test_crowd_knowledge_is_read_from_the_item_table_not_a_flag():
+    """It must work for a stranger, where no experiment marks the cold films."""
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=80, n_items=40, seed=21)
+    model = ContentTower(make_item_features(n_items=90), learn_weights=False).fit_global(ratings)
+    known = model.knows_crowd_opinion(np.arange(90))
+    assert known[:40].all()
+    assert not known[40:].any()

@@ -155,6 +155,16 @@ class Settings:
         return self.processed_dir / "movielens_item_factors.parquet"
 
     @property
+    def content_vectors_path(self) -> Path:
+        """Dense content vectors for MovieLens items, keyed by movieId.
+
+        Cached because building them means vectorising 84k films, which costs
+        minutes; nothing about them depends on ratings, so one build serves every
+        experiment and every user.
+        """
+        return self.processed_dir / "movielens_content_vectors.parquet"
+
+    @property
     def letterboxd_zip(self) -> Path:
         """The Letterboxd crowd dump, used as the catalogue skeleton."""
         return self.external_dir / "letterboxd-samlearner.zip"

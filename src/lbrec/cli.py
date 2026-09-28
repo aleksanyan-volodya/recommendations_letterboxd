@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import typer
 from rich.console import Console
@@ -26,12 +27,18 @@ from lbrec.evaluate import evaluate, tail_summary
 from lbrec.features import build_film_features
 from lbrec.generalise import (
     GIVEN_SIZES,
+    ITEM_BIAS_STRATEGIES,
+    TOP_K,
     BiasedMF,
     BiasModel,
     ContentTower,
     ItemMean,
+    StratifiedRanker,
     UserMean,
+    cold_item_split,
+    evaluate_cold_items,
     evaluate_generalisation,
+    frontier,
     movielens_item_features,
     split_users,
     summarise,
@@ -637,10 +644,7 @@ def generalise(
 
     models = [UserMean(), ItemMean(), BiasModel(), BiasedMF(n_factors=n_factors)]
     if content and settings.catalogue_path.exists():
-        console.print("building content vectors for MovieLens items...")
-        features = movielens_item_features(
-            pd.read_parquet(settings.catalogue_path), load(settings.movielens_dir, "links")
-        )
+        features = _content_vectors(settings)
         if features.empty:
             console.print("[yellow]no catalogue overlap; skipping the content tower[/yellow]")
         else:
@@ -660,6 +664,138 @@ def generalise(
         report.pivot_table(index="n_given", columns="model", values="rmse").round(4).reset_index()
     )
     _render(pivot, "Learning curve: how many ratings a new user needs")
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        per_user.to_csv(output, index=False)
+        console.print(f"wrote {output}")
+
+
+def _content_vectors(settings, *, rebuild: bool = False) -> pd.DataFrame:
+    """Load the cached content vectors, building them once if absent."""
+    path = settings.content_vectors_path
+    if path.exists() and not rebuild:
+        return pd.read_parquet(path)
+    if not settings.catalogue_path.exists():
+        raise typer.BadParameter("No catalogue. Run `lbrec catalogue` first.")
+    console.print("building content vectors for MovieLens items (cached afterwards)...")
+    features = movielens_item_features(
+        pd.read_parquet(settings.catalogue_path), load(settings.movielens_dir, "links")
+    )
+    if not features.empty:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        features.to_parquet(path)
+    return features
+
+
+@app.command("cold-items")
+def cold_items(
+    n_test_users: int = typer.Option(2000, help="Held-out users to evaluate on."),
+    share: float = typer.Option(0.2, help="Fraction of films to hide from the crowd."),
+    given: str = typer.Option("", help="Comma-separated history sizes. Empty means the sweep."),
+    n_factors: int = typer.Option(64, help="Latent factors for the fold-in model."),
+    bias_weights: str = typer.Option(
+        "", help="Comma-separated crowd-bias weights to sweep, e.g. '1,0.5,0.25,0'."
+    ),
+    seed: int = typer.Option(0, help="Random seed."),
+    rebuild_vectors: bool = typer.Option(False, help="Rebuild the cached content vectors."),
+    output: Path | None = typer.Option(None, help="Write per-user results to this CSV."),
+) -> None:
+    """Can we recommend films the crowd has never rated?
+
+    The question the project exists for, and the one MovieLens cannot answer as
+    given: every film in it has been rated, so a model's handling of the 1.07M
+    unrated films in the catalogue is untested. This hides a slice of films from
+    the global fit entirely, then ranks them *against* well-known films for
+    held-out users -- because a film is not suppressed by how it is scored, but by
+    what it loses to.
+
+    With ``--bias-weights`` it sweeps the crowd-bias discount instead of comparing
+    the three missing-bias strategies, tracing the accuracy/fairness frontier.
+    """
+    settings = get_settings()
+    if not (settings.movielens_dir / "ratings.parquet").exists():
+        raise typer.BadParameter("MovieLens not prepared. Run `lbrec movielens` first.")
+
+    sizes = tuple(int(v) for v in given.split(",") if v.strip()) or GIVEN_SIZES
+    features = _content_vectors(settings, rebuild=rebuild_vectors)
+    if features.empty:
+        raise typer.BadParameter("No catalogue overlap; cannot build content vectors.")
+    console.print(f"content vectors for [bold]{len(features):,}[/bold] MovieLens items")
+
+    ratings = load(settings.movielens_dir, "ratings", columns=["userId", "movieId", "rating"])
+    split = split_users(ratings, n_test_users=n_test_users, seed=seed)
+    cold = cold_item_split(ratings, share=share, seed=seed)
+    hidden = int(ratings["movieId"].isin(set(cold.tolist())).sum())
+    console.print(
+        f"hiding [bold]{len(cold):,}[/bold] films ({hidden:,} ratings) from the global fit; "
+        f"{len(split.test_users):,} held-out users"
+    )
+
+    weights = [float(v) for v in bias_weights.split(",") if v.strip()]
+    if weights:
+        # Sweeping the discount on the best-performing strategy: `predicted` is
+        # the accurate corner, so the curve runs from there down to taste alone.
+        models = [
+            ContentTower(features, item_bias="predicted", bias_weight=weight) for weight in weights
+        ]
+    else:
+        models = [
+            BiasModel(),
+            BiasedMF(n_factors=n_factors),
+            *(ContentTower(features, item_bias=strategy) for strategy in ITEM_BIAS_STRATEGIES),
+            StratifiedRanker(ContentTower(features, item_bias="predicted")),
+        ]
+    with tqdm(total=len(sizes), desc="history sizes", unit="sweep") as bar:
+        per_user = evaluate_cold_items(
+            models, ratings, split, cold, given_sizes=sizes, seed=seed, progress=bar
+        )
+
+    if per_user.empty:
+        console.print("[yellow]no user had both enough warm history and a cold film[/yellow]")
+        return
+
+    report = summarise(per_user).drop(columns=["rmse_sd", "rmse_warm"])
+    for column in report.columns.drop(["model", "n_given", "users"]):
+        report[column] = report[column].round(4)
+    # Short labels: eight full-width columns get truncated to illegibility.
+    report = report.rename(
+        columns={
+            "n_given": "given",
+            "rmse_cold": "cold",
+            "spearman": "spear",
+            "tail_share": "tail",
+            "tail_share_actual": "tail_true",
+        }
+    )
+    _render(report, "Crowd-less films ranked against well-known ones")
+
+    _render(
+        per_user.pivot_table(index="n_given", columns="model", values="rmse_cold")
+        .round(4)
+        .reset_index(),
+        "RMSE on the crowd-less films alone",
+    )
+    _render(
+        per_user.pivot_table(index="n_given", columns="model", values="tail_share")
+        .round(4)
+        .reset_index(),
+        f"Share of each user's top {TOP_K} that is crowd-less (compare tail_share_actual)",
+    )
+
+    verdict = frontier(per_user)
+    shown = verdict.assign(
+        pick=np.where(verdict["best"], "<-- best fair", ""),
+        fair=np.where(verdict["fair"], "yes", "no"),
+    ).drop(columns=["best"])
+    for column in ("spearman", "tail_share", "deserved", "fairness"):
+        shown[column] = shown[column].round(4)
+    _render(shown, "The objective: fair tail share first, then best ranking")
+    if not verdict["fair"].any():
+        console.print(
+            "[yellow]no model cleared the fairness bar; the frontier may have no usable "
+            "middle, which argues for a two-stage design rather than one weight[/yellow]"
+        )
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
