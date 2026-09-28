@@ -136,6 +136,73 @@ def read_letterboxd_dump(zip_path: Path, member: str = "movie_data.csv") -> pd.D
     return frame
 
 
+#: TMDb statuses that mean a film can actually be watched. The export contains
+#: announced and in-production titles with release years as far out as 2099;
+#: recommending those is worse than useless.
+WATCHABLE_STATUSES = frozenset({"Released"})
+
+
+def build_from_store(
+    films: pd.DataFrame, *, released_only: bool = True, require_title: bool = True
+) -> pd.DataFrame:
+    """Turn the bulk TMDb store into the candidate catalogue.
+
+    Supersedes the Letterboxd-dump catalogue entirely: the store carries the
+    full feature set (keywords, cast, crew) for every film TMDb knows, and
+    reaches the present rather than stopping in March 2022.
+
+    Filtering here is only ever about *whether a row is a watchable film*, never
+    about how well known it is. Unreleased and untitled entries go; obscure ones
+    stay, because dropping them would make them unrecommendable by construction.
+    """
+    frame = films[films["media_type"] == "movie"].copy()
+    before = len(frame)
+    dropped: dict[str, int] = {}
+
+    if require_title:
+        has_title = frame["title"].fillna("").astype(str).str.strip().ne("")
+        dropped["no title"] = int((~has_title).sum())
+        frame = frame[has_title]
+
+    if released_only:
+        released = frame["status"].isin(WATCHABLE_STATUSES)
+        dropped["not released"] = int((~released).sum())
+        frame = frame[released]
+
+    frame = frame.drop_duplicates("tmdb_id", ignore_index=True)
+    frame.attrs["dropped"] = dropped
+    frame.attrs["kept_share"] = len(frame) / before if before else 0.0
+    return frame
+
+
+def metadata_completeness(catalogue: pd.DataFrame) -> pd.DataFrame:
+    """How much metadata each popularity band actually has.
+
+    The number that shapes the modelling: keyword coverage is ~95% among the
+    best-known films and under 10% in the tail, so keyword features are a
+    head-of-catalogue luxury while director and overview are nearly universal.
+    A model that leans on keywords is implicitly a model of famous films.
+    """
+    if catalogue.empty:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame({"band": popularity_band(catalogue["vote_count"])})
+    for column in ("keywords", "cast", "directors", "genres"):
+        if column in catalogue:
+            frame[column] = catalogue[column].apply(
+                lambda value: value is not None and len(value) > 0
+            )
+    if "overview" in catalogue:
+        frame["overview"] = catalogue["overview"].fillna("").astype(str).str.strip().ne("")
+
+    report = frame.groupby("band", observed=True).agg(["size", "mean"])
+    films = report[(report.columns[0][0], "size")]
+    out = pd.DataFrame({"band": films.index, "films": films.to_numpy()})
+    for column in frame.columns.drop("band"):
+        out[column] = [f"{value:.0%}" for value in report[(column, "mean")]]
+    return out.reset_index(drop=True)
+
+
 def merge_known_films(catalogue: pd.DataFrame, enriched: pd.DataFrame) -> pd.DataFrame:
     """Overlay full TMDb metadata where we already have it.
 

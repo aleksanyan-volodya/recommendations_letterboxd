@@ -14,11 +14,28 @@ from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
 
-from lbrec.catalogue import catalogue_report, exclude_seen, merge_known_films, read_letterboxd_dump
+from lbrec.catalogue import (
+    build_from_store,
+    catalogue_report,
+    exclude_seen,
+    metadata_completeness,
+)
 from lbrec.config import get_settings
 from lbrec.enrich import enrich_films, popularity_report
 from lbrec.evaluate import evaluate, tail_summary
-from lbrec.features import CATALOGUE_BLOCKS, build_film_features
+from lbrec.features import build_film_features
+from lbrec.generalise import (
+    GIVEN_SIZES,
+    BiasedMF,
+    BiasModel,
+    ContentTower,
+    ItemMean,
+    UserMean,
+    evaluate_generalisation,
+    movielens_item_features,
+    split_users,
+    summarise,
+)
 from lbrec.letterboxd import coverage_report, film_status, load_export
 from lbrec.models import (
     CONTENT_ONLY,
@@ -41,7 +58,19 @@ from lbrec.resolve import (
     read_reviewed,
     resolve_films,
 )
-from lbrec.tmdb import TmdbClient, TmdbError
+from lbrec.tmdb import TmdbClient, TmdbError, detect_credential
+from lbrec.tmdb_bulk import (
+    DEFAULT_CONCURRENCY,
+    EXPORT_URL,
+    SHARD_SIZE,
+    FetchStats,
+    fetch_shard,
+    load_store,
+    next_shard_index,
+    pending_ids,
+    read_id_export,
+    write_shard,
+)
 
 app = typer.Typer(add_completion=False, help="Letterboxd recommender pipeline.")
 console = Console()
@@ -373,35 +402,130 @@ def list_models() -> None:
         )
 
 
-@app.command()
-def catalogue(
-    archive: Path | None = typer.Option(None, help="Letterboxd crowd dump zip."),
+@app.command("tmdb-export")
+def tmdb_export(
+    stamp: str | None = typer.Option(None, help="MM_DD_YYYY. Defaults to yesterday."),
 ) -> None:
-    """Build the candidate catalogue: every film we are allowed to recommend."""
+    """Download TMDb's daily id dump: the spine of the real catalogue."""
+    import datetime
+
+    import httpx
+
     settings = get_settings()
     settings.ensure_dirs()
-    zip_path = archive or settings.letterboxd_zip
-    if not zip_path.exists():
-        raise typer.BadParameter(f"{zip_path} not found.")
+    stamp = stamp or (datetime.date.today() - datetime.timedelta(days=1)).strftime("%m_%d_%Y")
+    url = EXPORT_URL.format(stamp=stamp)
+    target = settings.tmdb_export_path
 
-    console.print(f"reading {zip_path.name} (a few hundred rows are malformed and get skipped)...")
-    films = read_letterboxd_dump(zip_path)
+    console.print(f"downloading {url}")
+    with httpx.stream("GET", url, timeout=120, follow_redirects=True) as response:
+        response.raise_for_status()
+        with target.open("wb") as handle:
+            for chunk in response.iter_bytes(1 << 20):
+                handle.write(chunk)
     console.print(
-        f"[bold]{len(films):,}[/bold] films with a TMDb id "
-        f"({films.attrs['skipped_rows']:,} rows skipped)"
+        f"wrote {target.relative_to(settings.artifacts_dir.parent)} "
+        f"({target.stat().st_size / 1e6:.1f} MB)"
     )
 
-    if settings.films_tmdb_path.exists():
-        enriched = pd.read_parquet(settings.films_tmdb_path)
-        films = merge_known_films(films, enriched)
-        console.print(f"overlaid {int(films['enriched'].sum()):,} fully enriched films")
+    films = read_id_export(target)
+    console.print(
+        f"[bold]{len(films):,}[/bold] non-video films "
+        "(video=true entries are concert recordings and direct-to-video, not films)"
+    )
 
-    films.to_parquet(settings.catalogue_path, index=False)
-    _render(catalogue_report(films), "Catalogue by popularity decile (the REAL reference)")
+
+@app.command("tmdb-bulk")
+def tmdb_bulk(
+    concurrency: int = typer.Option(DEFAULT_CONCURRENCY, help="Parallel requests. 16 is optimal."),
+    shard_size: int = typer.Option(SHARD_SIZE, help="Films per parquet shard."),
+    limit: int | None = typer.Option(None, help="Stop after N films (for a dry run)."),
+) -> None:
+    """Enrich the whole of TMDb concurrently. Resumable: rerun to continue.
+
+    Ordered most-popular-first so the store is useful long before the run ends.
+    That is an ordering, never a filter -- every film is eventually fetched.
+    """
+    import asyncio
+
+    settings = get_settings()
+    settings.ensure_dirs()
+    if not settings.tmdb_export_path.exists():
+        raise typer.BadParameter("id export missing. Run `lbrec tmdb-export` first.")
+
+    try:
+        credential = detect_credential(settings)
+    except TmdbError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    films = read_id_export(settings.tmdb_export_path)
+    store = settings.tmdb_store_dir
+    todo = pending_ids(films["tmdb_id"], store)
+    if limit is not None:
+        todo = todo[:limit]
+
+    already = len(films) - len(pending_ids(films["tmdb_id"], store))
+    if not todo:
+        console.print(f"[green]nothing to do: all {already:,} films already stored[/green]")
+        return
+
+    console.print(
+        f"fetching [bold]{len(todo):,}[/bold] films at concurrency {concurrency} "
+        f"({already:,} already stored)"
+    )
+    totals = FetchStats()
+    index = next_shard_index(store)
+    chunks = [todo[i : i + shard_size] for i in range(0, len(todo), shard_size)]
+
+    with tqdm(total=len(todo), desc="fetching", unit="film", smoothing=0.05) as bar:
+        for chunk in chunks:
+            frame, stats = asyncio.run(fetch_shard(chunk, credential, concurrency=concurrency))
+            if not frame.empty:
+                write_shard(frame, store, index)
+                index += 1
+            totals.merge(stats)
+            bar.update(len(chunk))
+            bar.set_postfix(ok=totals.ok, gone=totals.missing, failed=totals.failed)
+
+    console.print(
+        f"[bold]{totals.ok:,}[/bold] fetched, {totals.missing:,} no longer on TMDb, "
+        f"{totals.failed:,} failed after retries ({totals.retries:,} retries)"
+    )
+    if totals.failures:
+        console.print(f"[yellow]first failures: {totals.failures[:10]}[/yellow]")
+    console.print(f"store: {store.relative_to(settings.artifacts_dir.parent)}")
+
+
+@app.command()
+def catalogue(
+    released_only: bool = typer.Option(True, help="Exclude unreleased and in-production films."),
+) -> None:
+    """Build the candidate catalogue from the bulk TMDb store."""
+    settings = get_settings()
+    settings.ensure_dirs()
+    if not settings.tmdb_store_dir.exists():
+        raise typer.BadParameter("no TMDb store. Run `lbrec tmdb-export` then `lbrec tmdb-bulk`.")
+
+    console.print("loading the bulk store...")
+    films = load_store(settings.tmdb_store_dir)
+    console.print(f"[bold]{len(films):,}[/bold] films in the store")
+
+    catalogue_films = build_from_store(films, released_only=released_only)
+    for reason, count in catalogue_films.attrs["dropped"].items():
+        console.print(f"  dropped {count:,} ({reason})")
+    console.print(
+        f"[bold]{len(catalogue_films):,}[/bold] recommendable films "
+        f"({catalogue_films.attrs['kept_share']:.1%} kept)"
+    )
+
+    catalogue_films.to_parquet(settings.catalogue_path, index=False)
+    _render(catalogue_report(catalogue_films), "Catalogue by popularity band")
+    _render(metadata_completeness(catalogue_films), "Metadata completeness by band")
     console.print(f"wrote {settings.catalogue_path.relative_to(settings.artifacts_dir.parent)}")
     console.print(
-        "[dim]Not filtered by popularity on purpose: trimming to well-voted films would "
-        "make obscure films unrecommendable by construction.[/dim]"
+        "[dim]Filtered only on whether a row is a watchable film, never on how well "
+        "known it is.[/dim]"
     )
 
 
@@ -449,10 +573,6 @@ def recommend_films(
         scorer = build_model(model)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    # Retrain on the intersection of features the catalogue also has.
-    if hasattr(scorer, "blocks"):
-        scorer.blocks = CATALOGUE_BLOCKS
-
     console.print(
         f"scoring [bold]{len(candidates):,}[/bold] candidates "
         f"({before - len(candidates):,} excluded as already seen) "
@@ -470,12 +590,80 @@ def recommend_films(
     _render(result.films, f"Top {k} for {paths.user} ({mode})")
     _render(summarise_popularity(result.films), "Where these sit on the popularity axis")
     console.print(
-        "[dim]Retrieval only: the catalogue has no keywords, cast or crew, so the model "
-        "was trained on the reduced feature set those films share.[/dim]"
+        "[dim]The catalogue carries the full feature set, but keyword coverage falls from "
+        "~95% in the popular head to under 10% in the tail; the n_* columns tell the model "
+        "when metadata is absent rather than empty.[/dim]"
     )
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         result.films.to_csv(output, index=False)
+        console.print(f"wrote {output}")
+
+
+@app.command("generalise")
+def generalise(
+    n_test_users: int = typer.Option(2000, help="Held-out users to evaluate on."),
+    given: str = typer.Option(
+        "", help="Comma-separated history sizes. Empty means the default sweep."
+    ),
+    n_factors: int = typer.Option(64, help="Latent factors for the fold-in model."),
+    seed: int = typer.Option(0, help="Random seed."),
+    content: bool = typer.Option(True, help="Include the content tower."),
+    output: Path | None = typer.Option(None, help="Write per-user results to this CSV."),
+) -> None:
+    """Measure whether a model works for users it has never seen.
+
+    Trains once on MovieLens users, then scores held-out users from their
+    history alone. This is the question a per-user regression cannot answer:
+    does the system work for a stranger, and how many ratings do they need?
+    """
+    settings = get_settings()
+    ratings_path = settings.movielens_dir / "ratings.parquet"
+    if not ratings_path.exists():
+        raise typer.BadParameter("MovieLens not prepared. Run `lbrec movielens` first.")
+
+    sizes = tuple(int(v) for v in given.split(",") if v.strip()) or GIVEN_SIZES
+    console.print("loading MovieLens ratings...")
+    ratings = load(settings.movielens_dir, "ratings", columns=["userId", "movieId", "rating"])
+    console.print(
+        f"[bold]{len(ratings):,}[/bold] ratings from {ratings['userId'].nunique():,} users"
+    )
+
+    split = split_users(ratings, n_test_users=n_test_users, seed=seed)
+    console.print(
+        f"holding out [bold]{len(split.test_users):,}[/bold] users; "
+        f"training on {len(split.train_users):,}"
+    )
+
+    models = [UserMean(), ItemMean(), BiasModel(), BiasedMF(n_factors=n_factors)]
+    if content and settings.catalogue_path.exists():
+        console.print("building content vectors for MovieLens items...")
+        features = movielens_item_features(
+            pd.read_parquet(settings.catalogue_path), load(settings.movielens_dir, "links")
+        )
+        if features.empty:
+            console.print("[yellow]no catalogue overlap; skipping the content tower[/yellow]")
+        else:
+            console.print(f"content vectors for [bold]{len(features):,}[/bold] MovieLens items")
+            models.append(ContentTower(features))
+    with tqdm(total=len(sizes), desc="history sizes", unit="sweep") as bar:
+        per_user = evaluate_generalisation(
+            models, ratings, split, given_sizes=sizes, seed=seed, progress=bar
+        )
+
+    report = summarise(per_user)
+    report["rmse"] = report["rmse"].round(4)
+    report["rmse_sd"] = report["rmse_sd"].round(4)
+    _render(report, "RMSE on held-out users (averaged per user)")
+
+    pivot = (
+        report.pivot_table(index="n_given", columns="model", values="rmse").round(4).reset_index()
+    )
+    _render(pivot, "Learning curve: how many ratings a new user needs")
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        per_user.to_csv(output, index=False)
         console.print(f"wrote {output}")
 
 
@@ -490,7 +678,7 @@ def evaluate_models(
     seed: int = typer.Option(0, help="Base random seed."),
     output: Path | None = typer.Option(None, help="Write per-decile results to this CSV."),
 ) -> None:
-    """Cross-validate models, reporting overall and per popularity decile."""
+    """Cross-validate models, reporting overall and per popularity band."""
     settings = get_settings()
     paths = settings.user(user)
     for path in (paths.film_status, settings.film_map_path, settings.films_tmdb_path):
@@ -550,14 +738,14 @@ def evaluate_models(
     for column in ("rmse", "rmse_sd", "mae", "spearman"):
         overall[column] = overall[column].astype(float).round(3)
     _render(overall, "Overall (lower RMSE better; rmse_sd is spread across repeats)")
-    _render(tail_summary(result.by_decile), "Head vs tail RMSE (tail = deciles 1-3)")
+    _render(tail_summary(result.by_decile), "Head vs tail RMSE (tail = bands 0 to 20-99)")
 
     pivot = (
-        result.by_decile.pivot_table(index="decile", columns="model", values="rmse")
+        result.by_decile.pivot_table(index="band", columns="model", values="rmse", observed=True)
         .round(3)
         .reset_index()
     )
-    _render(pivot, "RMSE by popularity decile")
+    _render(pivot, "RMSE by popularity band")
 
     for model in chosen:
         if isinstance(model, StackedEnsemble):

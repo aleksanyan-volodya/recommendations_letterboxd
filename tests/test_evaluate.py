@@ -227,3 +227,34 @@ def test_tail_summary_exposes_a_head_only_model(dataset):
     assert summary.loc["m", "rmse_tail"] == pytest.approx(1.4)  # mean of the four tail bands
     assert summary.loc["m", "rmse_head"] == pytest.approx(0.5)
     assert summary.loc["m", "gap"] > 0
+
+
+def test_vectoriser_settings_survive_sklearn_cloning():
+    """Regression: options behind ``**kwargs`` are invisible to ``get_params``.
+
+    ``ColumnTransformer`` clones its transformers before fitting, so any
+    ``__init__`` argument not named explicitly is silently dropped. That turned a
+    3,000-term vocabulary cap into 86,133 columns on the full catalogue and a
+    161 GB allocation -- with no error until the memory ran out.
+    """
+    from sklearn.base import clone
+
+    from lbrec.features import TextBlock
+
+    block = TextBlock(components=8, max_features=1500, min_df=2, token_pattern=r"[^ ]+")
+    copied = clone(block)
+    assert copied.max_features == 1500
+    assert copied.min_df == 2
+    assert copied.token_pattern == r"[^ ]+"
+    assert copied.components == 8
+
+
+def test_vocabulary_cap_is_actually_enforced():
+    """The cap must bind on real data, not merely be stored on the object."""
+    from sklearn.base import clone
+
+    from lbrec.features import TextBlock
+
+    documents = [f"tok{i} tok{i + 1} shared" for i in range(500)]
+    fitted = clone(TextBlock(max_features=50, min_df=1, token_pattern=r"[^ ]+")).fit(documents)
+    assert fitted.transform(documents).shape[1] <= 50

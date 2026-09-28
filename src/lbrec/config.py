@@ -160,6 +160,16 @@ class Settings:
         return self.external_dir / "letterboxd-samlearner.zip"
 
     @property
+    def tmdb_export_path(self) -> Path:
+        """TMDb's daily id dump, as downloaded."""
+        return self.external_dir / "tmdb_movie_ids.json.gz"
+
+    @property
+    def tmdb_store_dir(self) -> Path:
+        """Sharded bulk enrichment of the whole of TMDb. Shared across users."""
+        return self.external_dir / "tmdb_films"
+
+    @property
     def catalogue_path(self) -> Path:
         """Every film we are allowed to recommend. Shared across users."""
         return self.processed_dir / "catalogue.parquet"

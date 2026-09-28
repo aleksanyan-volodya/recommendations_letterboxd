@@ -29,7 +29,22 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 #: Columns of list type that become bag-of-words documents.
 LIST_COLUMNS = ("genres", "keywords", "directors", "cast", "production_countries")
 
-NUMERIC_COLUMNS = ["year", "runtime", "log_votes", "crowd_shrunk"]
+NUMERIC_COLUMNS = [
+    "year",
+    "runtime",
+    "log_votes",
+    "crowd_shrunk",
+    # Metadata richness. Across the full catalogue keyword coverage runs from
+    # ~95% among the best-known films to under 10% in the tail, so an empty
+    # keyword vector means "nobody catalogued this", not "this film is about
+    # nothing". Without these columns the model cannot tell the two apart, and
+    # a film's absence of metadata silently reads as a content signal.
+    "n_keywords",
+    "n_cast",
+    "n_directors",
+    "n_genres",
+    "overview_length",
+]
 
 #: Prior for shrinking the crowd score, measured from films with >=100 votes.
 CROWD_PRIOR_MEAN = 6.5
@@ -127,6 +142,23 @@ def build_film_features(films: pd.DataFrame) -> pd.DataFrame:
     overview = films.get("overview", pd.Series("", index=films.index)).fillna("")
     tagline = films.get("tagline", pd.Series("", index=films.index)).fillna("")
     frame["synopsis"] = (overview.astype(str) + " " + tagline.astype(str)).str.strip().str.lower()
+
+    # How much metadata this film has, as an explicit signal. See NUMERIC_COLUMNS.
+    for column, source in (
+        ("n_keywords", "keywords"),
+        ("n_cast", "cast"),
+        ("n_directors", "directors"),
+        ("n_genres", "genres"),
+    ):
+        if source in films:
+            frame[column] = (
+                films[source]
+                .apply(lambda value: 0 if value is None else len(value))
+                .astype("Float64")
+            )
+        else:
+            frame[column] = pd.Series(0.0, index=films.index, dtype="Float64")
+    frame["overview_length"] = overview.astype(str).str.len().astype("Float64")
     return frame
 
 
@@ -149,14 +181,44 @@ class TextBlock(BaseEstimator, TransformerMixin):
     components carry the singular values and so dwarf L2-normalised TF-IDF and
     standardised numerics sitting beside them -- an arbitrary weighting, not a
     modelling decision.
+
+    Every vectoriser setting is an explicit named argument rather than
+    ``**kwargs``. sklearn's ``get_params`` introspects the ``__init__``
+    signature, so options hidden behind ``**kwargs`` are invisible to it -- and
+    ``ColumnTransformer`` clones its transformers before fitting, which silently
+    dropped them. The symptom was a vocabulary cap of 3,000 producing 86,133
+    columns, and a 161 GB allocation; the cause was a parameter that never
+    reached the vectoriser at all.
     """
 
-    def __init__(self, *, components: int | None = None, **vectorizer_kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        components: int | None = None,
+        max_features: int | None = None,
+        min_df: int | float = 1,
+        token_pattern: str = r"(?u)\b\w\w+\b",
+        stop_words: str | None = None,
+        ngram_range: tuple[int, int] = (1, 1),
+        sublinear_tf: bool = False,
+    ) -> None:
         self.components = components
-        self.vectorizer_kwargs = vectorizer_kwargs
+        self.max_features = max_features
+        self.min_df = min_df
+        self.token_pattern = token_pattern
+        self.stop_words = stop_words
+        self.ngram_range = ngram_range
+        self.sublinear_tf = sublinear_tf
 
     def fit(self, X, y=None):  # noqa: N803 - sklearn's parameter name
-        self.vectorizer_ = TfidfVectorizer(**self.vectorizer_kwargs)
+        self.vectorizer_ = TfidfVectorizer(
+            max_features=self.max_features,
+            min_df=self.min_df,
+            token_pattern=self.token_pattern,
+            stop_words=self.stop_words,
+            ngram_range=self.ngram_range,
+            sublinear_tf=self.sublinear_tf,
+        )
         self.svd_ = None
         self.scaler_ = None
         try:
