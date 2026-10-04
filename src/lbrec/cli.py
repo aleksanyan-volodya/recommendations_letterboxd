@@ -22,6 +22,22 @@ from lbrec.catalogue import (
     metadata_completeness,
 )
 from lbrec.config import get_settings
+from lbrec.crowd import (
+    DUMP_FREETH,
+    DUMP_SAMLEARNER,
+    MIN_RATERS,
+    build_pool,
+    latest_snapshot,
+    map_slugs,
+    mapping_report,
+    pool_by_year,
+    pool_summary,
+    ratings_by_film,
+    read_freeth_films,
+    read_freeth_ratings,
+    read_samlearner_films,
+    read_samlearner_ratings,
+)
 from lbrec.enrich import enrich_films, popularity_report
 from lbrec.evaluate import evaluate, tail_summary
 from lbrec.features import build_film_features
@@ -29,6 +45,7 @@ from lbrec.generalise import (
     GIVEN_SIZES,
     ITEM_BIAS_STRATEGIES,
     TOP_K,
+    VALIDATED_COLD_SHARE,
     BiasedMF,
     BiasModel,
     ContentTower,
@@ -51,7 +68,14 @@ from lbrec.models import (
     build_model,
     default_models,
 )
-from lbrec.movielens import build_item_factors, coverage_by_popularity, link_films, load, prepare
+from lbrec.movielens import (
+    build_item_factors,
+    coverage_by_popularity,
+    link_films,
+    load,
+    prepare,
+    rated_tmdb_ids,
+)
 from lbrec.profile import build_profile, popularity_gap
 from lbrec.recommend import RANK_MODES, RANK_PLAIN, recommend, summarise_popularity
 from lbrec.resolve import (
@@ -534,6 +558,151 @@ def catalogue(
         "[dim]Filtered only on whether a row is a watchable film, never on how well "
         "known it is.[/dim]"
     )
+
+
+@app.command()
+def crowd() -> None:
+    """Merge the Letterboxd crowd dumps into ratings keyed by TMDb id.
+
+    A member's newest scrape replaces their older one wholesale. Slugs keep
+    Letterboxd's own TMDb link where a dump carries it, and otherwise get one
+    only when exactly one catalogue film shares their title and year.
+    """
+    settings = get_settings()
+    settings.ensure_dirs()
+    if not settings.catalogue_path.exists():
+        raise typer.BadParameter("catalogue not built. Run `lbrec catalogue` first.")
+
+    # Oldest first: later dumps supersede earlier ones member by member.
+    dumps = [
+        (DUMP_SAMLEARNER, settings.samlearner_zip, read_samlearner_ratings, read_samlearner_films),
+        (DUMP_FREETH, settings.freeth_zip, read_freeth_ratings, read_freeth_films),
+    ]
+    present = [dump for dump in dumps if dump[1].exists()]
+    for name, path, *_ in dumps:
+        if not path.exists():
+            console.print(f"[yellow]{name}: {path.name} not found, so it is left out[/yellow]")
+    if not settings.freeth_zip.exists():
+        console.print(
+            "[yellow]  fetch it with: uvx kaggle datasets download "
+            "freeth/letterboxd-film-ratings -p artifacts/external[/yellow]"
+        )
+    if not present:
+        raise typer.BadParameter("no crowd dump found in artifacts/external.")
+
+    rating_frames, film_frames = [], []
+    for name, path, read_ratings, read_films in present:
+        console.print(f"reading {path.name}...")
+        frame = read_ratings(path)
+        films = read_films(path)
+        console.print(
+            f"  {name}: [bold]{len(frame):,}[/bold] ratings from "
+            f"{frame['member'].nunique():,} members over {frame['slug'].nunique():,} slugs"
+        )
+        rating_frames.append((name, frame))
+        film_frames.append(films)
+
+    merged = latest_snapshot(rating_frames)
+    for name, count in merged.attrs["superseded"].items():
+        if count:
+            console.print(f"  {count:,} {name} members replaced by a newer scrape")
+    console.print(
+        f"merged: [bold]{len(merged):,}[/bold] ratings from {merged['member'].nunique():,} members"
+    )
+
+    console.print("mapping slugs to TMDb ids...")
+    catalogue_films = pd.read_parquet(
+        settings.catalogue_path, columns=["tmdb_id", "title", "original_title", "year"]
+    )
+    live_ids = None
+    if settings.tmdb_export_path.exists():
+        live_ids = set(read_id_export(settings.tmdb_export_path, include_video=True)["tmdb_id"])
+    else:
+        console.print("[yellow]no TMDb id export: dead links cannot be told apart[/yellow]")
+    slug_map = map_slugs(film_frames, catalogue_films, live_ids=live_ids)
+    _render(mapping_report(merged, slug_map), "How rated slugs got a TMDb id")
+
+    keyed = ratings_by_film(merged, slug_map)
+    if keyed.attrs["merged_duplicates"]:
+        console.print(
+            f"  {keyed.attrs['merged_duplicates']:,} ratings were one member rating two slugs "
+            "of one film; averaged into one"
+        )
+    slug_map.to_parquet(settings.crowd_films_path, index=False)
+    keyed.to_parquet(settings.crowd_ratings_path, index=False)
+    console.print(
+        f"[bold]{len(keyed):,}[/bold] ratings of {keyed['tmdb_id'].nunique():,} films from "
+        f"{keyed['member'].nunique():,} members"
+    )
+    for path in (settings.crowd_ratings_path, settings.crowd_films_path):
+        console.print(f"wrote {path.relative_to(settings.artifacts_dir.parent)}")
+
+
+@app.command()
+def pool(
+    min_raters: int = typer.Option(
+        MIN_RATERS, help="Distinct crowd members who must have rated a film."
+    ),
+) -> None:
+    """Build the candidate pool: recommendable films with a Letterboxd audience.
+
+    Over the raw catalogue 93% of films have no crowd signal, so a fairness quota
+    proportional to that share would fill a top ten with films nobody has rated.
+    The pool keeps only films people have demonstrably watched, which brings the
+    crowd-less share back into the range the stratified ranker was measured on.
+    """
+    import datetime
+
+    settings = get_settings()
+    for path, step in (
+        (settings.crowd_ratings_path, "lbrec crowd"),
+        (settings.catalogue_path, "lbrec catalogue"),
+        (settings.movielens_dir / "ratings.parquet", "lbrec movielens"),
+    ):
+        if not path.exists():
+            raise typer.BadParameter(f"{path.name} not found. Run `{step}` first.")
+
+    crowd_ratings = pd.read_parquet(settings.crowd_ratings_path, columns=["member", "tmdb_id"])
+    catalogue_films = pd.read_parquet(
+        settings.catalogue_path, columns=["tmdb_id", "year", "vote_count"]
+    )
+    pool_films = build_pool(crowd_ratings, catalogue_films, min_raters=min_raters)
+    pool_films.to_parquet(settings.pool_path, index=False)
+
+    links = load(settings.movielens_dir, "links")
+    rated = load(settings.movielens_dir, "ratings", columns=["movieId"])["movieId"].unique()
+    summary = pool_summary(pool_films, catalogue_films, rated_tmdb_ids(links, rated))
+
+    low, high = VALIDATED_COLD_SHARE
+    cold = summary["movielens_cold"]
+    inside = low <= cold <= high
+    console.print(
+        f"[bold]{summary['films']:,}[/bold] films rated by >= {min_raters} members "
+        f"({pool_films.attrs['rated_elsewhere']:,} more are rated but not in the catalogue)"
+    )
+    console.print(
+        f"crowd-less (no MovieLens rating): [bold]{cold:.1%}[/bold] -- "
+        + (
+            f"[green]inside[/green] the validated {low:.0%}-{high:.0%}"
+            if inside
+            else f"[red]outside[/red] the validated {low:.0%}-{high:.0%}; the stratified "
+            "ranker's fairness is unmeasured here"
+        )
+    )
+    console.print(
+        f"TMDb votes: median {summary['median_tmdb_votes']:.0f}, "
+        f"{summary['under_20_tmdb_votes']:.1%} under 20, "
+        f"{summary['zero_tmdb_votes']:,} with none"
+    )
+
+    in_pool = catalogue_films[catalogue_films["tmdb_id"].isin(pool_films["tmdb_id"])]
+    _render(catalogue_report(in_pool), "Pool by TMDb popularity band")
+    this_year = datetime.date.today().year
+    _render(
+        pool_by_year(pool_films, catalogue_films, range(this_year - 12, this_year + 1)),
+        "Pool per release year: where the dumps' horizon bites",
+    )
+    console.print(f"wrote {settings.pool_path.relative_to(settings.artifacts_dir.parent)}")
 
 
 @app.command("recommend")

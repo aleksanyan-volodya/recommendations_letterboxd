@@ -876,6 +876,13 @@ def _ranking_metrics(
 #: not to reward the noise in a single user's top ten.
 FAIR_TOLERANCE = 0.1
 
+#: Crowd-less share of the candidate set over which `StratifiedRanker` has been
+#: measured fair: mean per-user ``cold_share`` in the cold-items run, 0.250 at
+#: 10 given ratings to 0.461 at 200. Its quota is that share, so outside this
+#: range the guarantee is extrapolated, not measured -- over the raw 1.15M
+#: catalogue (93% crowd-less) it would fill a top ten with unrated films.
+VALIDATED_COLD_SHARE = (0.25, 0.46)
+
 
 def frontier(per_user: pd.DataFrame, *, tolerance: float = FAIR_TOLERANCE) -> pd.DataFrame:
     """Rank models by the project's actual objective, not by RMSE.

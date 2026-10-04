@@ -134,6 +134,19 @@ def link_films(film_map: pd.DataFrame, links: pd.DataFrame) -> pd.DataFrame:
     return joined
 
 
+def rated_tmdb_ids(links: pd.DataFrame, rated_movie_ids) -> set[int]:
+    """TMDb ids of films with at least one MovieLens rating.
+
+    Not the same as every TMDb id in ``links.csv``: ml-32m links 3,150 films
+    that nobody in it rated. They have no item bias, so for anything that asks
+    "does the crowd know this film" they are as cold as a film MovieLens has
+    never heard of. Counting them as known understated the pool's crowd-less
+    share by over a point.
+    """
+    rated = links[links["movieId"].isin(set(rated_movie_ids))]
+    return set(pd.to_numeric(rated["tmdbId"], errors="coerce").dropna().astype("int64"))
+
+
 # Items rated fewer times than this get no factor. A handful of ratings
 # produces a direction indistinguishable from noise.
 MIN_ITEM_RATINGS = 20

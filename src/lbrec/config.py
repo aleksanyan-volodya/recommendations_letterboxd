@@ -165,9 +165,29 @@ class Settings:
         return self.processed_dir / "movielens_content_vectors.parquet"
 
     @property
-    def letterboxd_zip(self) -> Path:
-        """The Letterboxd crowd dump, used as the catalogue skeleton."""
+    def samlearner_zip(self) -> Path:
+        """Letterboxd crowd dump, scraped Nov 2020 -> Mar 2022. Carries TMDb ids."""
         return self.external_dir / "letterboxd-samlearner.zip"
+
+    @property
+    def freeth_zip(self) -> Path:
+        """Letterboxd crowd dump, scraped Oct 2023. Slugs only, no TMDb ids."""
+        return self.external_dir / "letterboxd-film-ratings.zip"
+
+    @property
+    def crowd_ratings_path(self) -> Path:
+        """Both dumps merged, one row per (member, film), keyed by TMDb id."""
+        return self.processed_dir / "crowd_ratings.parquet"
+
+    @property
+    def crowd_films_path(self) -> Path:
+        """Every Letterboxd slug the dumps mention, and how it got its TMDb id."""
+        return self.processed_dir / "crowd_films.parquet"
+
+    @property
+    def pool_path(self) -> Path:
+        """The candidate pool: recommendable films with a Letterboxd audience."""
+        return self.processed_dir / "pool.parquet"
 
     @property
     def tmdb_export_path(self) -> Path:
