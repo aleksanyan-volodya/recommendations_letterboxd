@@ -26,6 +26,7 @@ from lbrec.crowd import (
     DUMP_FREETH,
     DUMP_SAMLEARNER,
     MIN_RATERS,
+    as_model_ratings,
     build_pool,
     crowd_item_bias,
     latest_snapshot,
@@ -54,6 +55,7 @@ from lbrec.generalise import (
     ItemMean,
     StratifiedRanker,
     UserMean,
+    catalogue_item_features,
     cold_item_split,
     evaluate_cold_items,
     evaluate_generalisation,
@@ -73,12 +75,14 @@ from lbrec.models import (
 from lbrec.movielens import (
     build_item_factors,
     by_movie_id,
+    by_tmdb_id,
     coverage_by_popularity,
     link_films,
     load,
     prepare,
     rated_tmdb_ids,
 )
+from lbrec.movielens import item_bias as movielens_item_bias
 from lbrec.profile import build_profile, popularity_gap
 from lbrec.recommend import RANK_MODES, RANK_PLAIN, recommend, summarise_popularity
 from lbrec.resolve import (
@@ -108,6 +112,11 @@ from lbrec.tmdb_bulk import (
 
 app = typer.Typer(add_completion=False, help="Letterboxd recommender pipeline.")
 console = Console()
+
+#: Whose ratings train the shared models and whose held-out users test them.
+CROWD_MOVIELENS = "movielens"
+CROWD_LETTERBOXD = "letterboxd"
+CROWDS = (CROWD_MOVIELENS, CROWD_LETTERBOXD)
 
 
 @app.callback()
@@ -788,25 +797,20 @@ def generalise(
     n_factors: int = typer.Option(64, help="Latent factors for the fold-in model."),
     seed: int = typer.Option(0, help="Random seed."),
     content: bool = typer.Option(True, help="Include the content tower."),
+    crowd: str = typer.Option(
+        CROWD_MOVIELENS, help=f"Who trains and who is tested: {', '.join(CROWDS)}."
+    ),
     output: Path | None = typer.Option(None, help="Write per-user results to this CSV."),
 ) -> None:
     """Measure whether a model works for users it has never seen.
 
-    Trains once on MovieLens users, then scores held-out users from their
+    Trains once on one crowd's users, then scores held-out users from their
     history alone. This is the question a per-user regression cannot answer:
     does the system work for a stranger, and how many ratings do they need?
     """
     settings = get_settings()
-    ratings_path = settings.movielens_dir / "ratings.parquet"
-    if not ratings_path.exists():
-        raise typer.BadParameter("MovieLens not prepared. Run `lbrec movielens` first.")
-
     sizes = tuple(int(v) for v in given.split(",") if v.strip()) or GIVEN_SIZES
-    console.print("loading MovieLens ratings...")
-    ratings = load(settings.movielens_dir, "ratings", columns=["userId", "movieId", "rating"])
-    console.print(
-        f"[bold]{len(ratings):,}[/bold] ratings from {ratings['userId'].nunique():,} users"
-    )
+    ratings = _training_ratings(settings, crowd)
 
     split = split_users(ratings, n_test_users=n_test_users, seed=seed)
     console.print(
@@ -816,11 +820,11 @@ def generalise(
 
     models = [UserMean(), ItemMean(), BiasModel(), BiasedMF(n_factors=n_factors)]
     if content and settings.catalogue_path.exists():
-        features = _content_vectors(settings)
+        features = _training_vectors(settings, crowd)
         if features.empty:
             console.print("[yellow]no catalogue overlap; skipping the content tower[/yellow]")
         else:
-            console.print(f"content vectors for [bold]{len(features):,}[/bold] MovieLens items")
+            console.print(f"content vectors for [bold]{len(features):,}[/bold] films")
             models.append(ContentTower(features))
     with tqdm(total=len(sizes), desc="history sizes", unit="sweep") as bar:
         per_user = evaluate_generalisation(
@@ -843,30 +847,108 @@ def generalise(
         console.print(f"wrote {output}")
 
 
-def _content_vectors(settings, *, rebuild: bool = False) -> pd.DataFrame:
-    """Load the cached content vectors, building them once if absent.
+def _check_crowd(crowd: str) -> None:
+    if crowd not in CROWDS:
+        raise typer.BadParameter(f"unknown crowd {crowd!r}; expected one of {', '.join(CROWDS)}")
 
-    Also rebuilt when the catalogue is newer than the cache: vectors from an
-    older catalogue silently describe a different set of films.
+
+def _training_ratings(settings, crowd: str) -> pd.DataFrame:
+    """One crowd's ratings as ``userId, movieId, rating`` on the 0.5-5 scale.
+
+    For Letterboxd, ``movieId`` holds the TMDb id: the models only need some
+    item key, and the content vectors are keyed the same way.
     """
-    path = settings.content_vectors_path
-    if not settings.catalogue_path.exists():
+    _check_crowd(crowd)
+    if crowd == CROWD_MOVIELENS:
+        if not (settings.movielens_dir / "ratings.parquet").exists():
+            raise typer.BadParameter("MovieLens not prepared. Run `lbrec movielens` first.")
+        console.print("loading MovieLens ratings...")
+        ratings = load(settings.movielens_dir, "ratings", columns=["userId", "movieId", "rating"])
+    else:
+        if not settings.crowd_ratings_path.exists():
+            raise typer.BadParameter("no crowd ratings. Run `lbrec crowd` first.")
+        console.print("loading Letterboxd crowd ratings...")
+        ratings = as_model_ratings(
+            pd.read_parquet(settings.crowd_ratings_path, columns=["member", "tmdb_id", "rating"])
+        )
+    console.print(
+        f"[bold]{len(ratings):,}[/bold] ratings from {ratings['userId'].nunique():,} users"
+    )
+    return ratings
+
+
+def _training_vectors(settings, crowd: str, *, rebuild: bool = False) -> pd.DataFrame:
+    _check_crowd(crowd)
+    if crowd == CROWD_MOVIELENS:
+        return _content_vectors(settings, rebuild=rebuild)
+    return _crowd_vectors(settings, rebuild=rebuild)
+
+
+def _borrowed_bias(settings, crowd: str) -> tuple[str, pd.Series]:
+    """The *other* crowd's item biases, keyed like the training crowd's films."""
+    links = load(settings.movielens_dir, "links")
+    if crowd == CROWD_MOVIELENS:
+        if not settings.crowd_ratings_path.exists():
+            raise typer.BadParameter("no crowd ratings. Run `lbrec crowd`, or pass --no-borrow.")
+        lent = crowd_item_bias(
+            pd.read_parquet(settings.crowd_ratings_path, columns=["tmdb_id", "rating"])
+        )
+        return "Letterboxd", by_movie_id(lent, links)
+    ratings = load(settings.movielens_dir, "ratings", columns=["movieId", "rating"])
+    return "MovieLens", by_tmdb_id(movielens_item_bias(ratings), links)
+
+
+def _cached_vectors(path: Path, sources: list[Path], build, *, rebuild: bool) -> pd.DataFrame:
+    """Load cached content vectors, or build and cache them.
+
+    Rebuilt when any source is newer than the cache: vectors from an older
+    catalogue silently describe a different set of films.
+    """
+    missing = [source for source in sources if not source.exists()]
+    if missing:
         if path.exists() and not rebuild:
             return pd.read_parquet(path)
-        raise typer.BadParameter("No catalogue. Run `lbrec catalogue` first.")
-    stale = path.exists() and path.stat().st_mtime < settings.catalogue_path.stat().st_mtime
+        raise typer.BadParameter(f"{missing[0].name} not found; cannot build content vectors.")
+    newest = max(source.stat().st_mtime for source in sources)
+    stale = path.exists() and path.stat().st_mtime < newest
     if path.exists() and not rebuild and not stale:
         return pd.read_parquet(path)
     if stale and not rebuild:
-        console.print("[yellow]catalogue is newer than the cached content vectors[/yellow]")
-    console.print("building content vectors for MovieLens items (cached afterwards)...")
-    features = movielens_item_features(
-        pd.read_parquet(settings.catalogue_path), load(settings.movielens_dir, "links")
-    )
+        console.print(f"[yellow]{path.name} is older than its sources; rebuilding[/yellow]")
+    console.print(f"building {path.name} (cached afterwards)...")
+    features = build()
     if not features.empty:
         path.parent.mkdir(parents=True, exist_ok=True)
         features.to_parquet(path)
     return features
+
+
+def _content_vectors(settings, *, rebuild: bool = False) -> pd.DataFrame:
+    """Content vectors for MovieLens items, keyed by movieId."""
+    return _cached_vectors(
+        settings.content_vectors_path,
+        [settings.catalogue_path],
+        lambda: movielens_item_features(
+            pd.read_parquet(settings.catalogue_path), load(settings.movielens_dir, "links")
+        ),
+        rebuild=rebuild,
+    )
+
+
+def _crowd_vectors(settings, *, rebuild: bool = False) -> pd.DataFrame:
+    """Content vectors for every catalogue film the Letterboxd crowd rated."""
+
+    def build() -> pd.DataFrame:
+        rated = pd.read_parquet(settings.crowd_ratings_path, columns=["tmdb_id"])["tmdb_id"]
+        films = pd.read_parquet(settings.catalogue_path)
+        return catalogue_item_features(films[films["tmdb_id"].isin(set(rated.unique()))])
+
+    return _cached_vectors(
+        settings.crowd_vectors_path,
+        [settings.catalogue_path, settings.crowd_ratings_path],
+        build,
+        rebuild=rebuild,
+    )
 
 
 @app.command("cold-items")
@@ -881,7 +963,10 @@ def cold_items(
     seed: int = typer.Option(0, help="Random seed."),
     rebuild_vectors: bool = typer.Option(False, help="Rebuild the cached content vectors."),
     borrow: bool = typer.Option(
-        True, help="Add models that borrow b_i from the Letterboxd crowd for hidden films."
+        True, help="Add models that borrow b_i from the other crowd for hidden films."
+    ),
+    crowd: str = typer.Option(
+        CROWD_MOVIELENS, help=f"Who trains and who is tested: {', '.join(CROWDS)}."
     ),
     output: Path | None = typer.Option(None, help="Write per-user results to this CSV."),
 ) -> None:
@@ -897,24 +982,22 @@ def cold_items(
     With ``--bias-weights`` it sweeps the crowd-bias discount instead of comparing
     the three missing-bias strategies, tracing the accuracy/fairness frontier.
 
-    With ``--borrow`` (the default) a hidden film is cold to MovieLens but not
-    to the Letterboxd crowd, which is the real situation for 38% of the pool.
-    The borrowed models test whether a bias *measured* by that second crowd
-    can replace one guessed from metadata.
+    With ``--borrow`` (the default) a hidden film is cold to the training crowd
+    but not to the other one -- for MovieLens, the real situation of 38% of the
+    pool. The borrowed models test whether a bias *measured* by that second
+    crowd can replace one guessed from metadata.
+
+    ``--crowd letterboxd`` trains and tests on Letterboxd members instead, the
+    population the recommender is actually for, and borrows from MovieLens.
     """
     settings = get_settings()
-    if not (settings.movielens_dir / "ratings.parquet").exists():
-        raise typer.BadParameter("MovieLens not prepared. Run `lbrec movielens` first.")
-    if borrow and not settings.crowd_ratings_path.exists():
-        raise typer.BadParameter("no crowd ratings. Run `lbrec crowd`, or pass --no-borrow.")
-
     sizes = tuple(int(v) for v in given.split(",") if v.strip()) or GIVEN_SIZES
-    features = _content_vectors(settings, rebuild=rebuild_vectors)
+    ratings = _training_ratings(settings, crowd)
+    features = _training_vectors(settings, crowd, rebuild=rebuild_vectors)
     if features.empty:
         raise typer.BadParameter("No catalogue overlap; cannot build content vectors.")
-    console.print(f"content vectors for [bold]{len(features):,}[/bold] MovieLens items")
+    console.print(f"content vectors for [bold]{len(features):,}[/bold] films")
 
-    ratings = load(settings.movielens_dir, "ratings", columns=["userId", "movieId", "rating"])
     split = split_users(ratings, n_test_users=n_test_users, seed=seed)
     cold = cold_item_split(ratings, share=share, seed=seed)
     hidden = int(ratings["movieId"].isin(set(cold.tolist())).sum())
@@ -938,15 +1021,10 @@ def cold_items(
             StratifiedRanker(ContentTower(features, item_bias="predicted")),
         ]
         if borrow:
-            crowd_ratings = pd.read_parquet(
-                settings.crowd_ratings_path, columns=["tmdb_id", "rating"]
-            )
-            lent = by_movie_id(
-                crowd_item_bias(crowd_ratings), load(settings.movielens_dir, "links")
-            )
+            lender, lent = _borrowed_bias(settings, crowd)
             measured = int(pd.Index(cold).isin(lent.index).sum())
             console.print(
-                f"the Letterboxd crowd has rated [bold]{measured:,}[/bold] of the "
+                f"the {lender} crowd has rated [bold]{measured:,}[/bold] of the "
                 f"{len(cold):,} hidden films"
             )
             models += [
@@ -966,8 +1044,8 @@ def cold_items(
         if fit:
             console.print(
                 f"{model.name}: calibrated on {fit['films']:,.0f} films both crowds rated, "
-                f"corr {fit['corr']:.3f}, MovieLens b_i = {fit['intercept']:+.3f} "
-                f"+ {fit['slope']:.3f} x Letterboxd b_i"
+                f"corr {fit['corr']:.3f}, own b_i = {fit['intercept']:+.3f} "
+                f"+ {fit['slope']:.3f} x borrowed b_i"
             )
 
     if per_user.empty:

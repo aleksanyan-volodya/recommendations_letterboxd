@@ -16,8 +16,10 @@ import pytest
 from lbrec.movielens import (
     archive_prefix,
     by_movie_id,
+    by_tmdb_id,
     coverage_by_popularity,
     imdb_tt,
+    item_bias,
     link_films,
     load,
     prepare,
@@ -126,6 +128,19 @@ def test_rekeying_by_movie_id_never_fans_out():
     links = pd.DataFrame({"movieId": [1, 2, 3, 4], "tmdbId": [10.0, 10.0, None, 30.0]})
     out = by_movie_id(pd.Series({10: 0.5, 30: -0.2, 99: 1.0}), links)
     assert out.to_dict() == {1: 0.5, 4: -0.2}
+
+
+def test_rekeying_by_tmdb_id_is_the_inverse():
+    links = pd.DataFrame({"movieId": [1, 2, 3], "tmdbId": [10.0, 10.0, 30.0]})
+    out = by_tmdb_id(pd.Series({1: 0.5, 2: 9.9, 3: -0.2}), links)
+    assert out.to_dict() == {10: 0.5, 30: -0.2}
+
+
+def test_item_bias_is_the_models_shrunk_estimator():
+    ratings = pd.DataFrame({"movieId": [1, 1, 2, 2], "rating": [5.0, 5.0, 1.0, 1.0]})
+    bias = item_bias(ratings, prior=2.0)
+    # mean 3.0; film 1: (10 - 2*3) / (2+2) = 1.0
+    assert bias.to_dict() == {1: 1.0, 2: -1.0}
 
 
 def test_coverage_is_reported_per_popularity_decile():

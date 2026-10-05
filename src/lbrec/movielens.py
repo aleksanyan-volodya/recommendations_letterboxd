@@ -134,24 +134,43 @@ def link_films(film_map: pd.DataFrame, links: pd.DataFrame) -> pd.DataFrame:
     return joined
 
 
-def by_movie_id(by_tmdb: pd.Series, links: pd.DataFrame) -> pd.Series:
-    """Re-key a TMDb-indexed series to MovieLens ``movieId``.
-
-    ``links.csv`` is not one-to-one in either direction (blank and repeated
-    tmdbIds), so both sides are deduplicated first; a value never fans out to
-    two films or two values into one.
-    """
+def _bridge(links: pd.DataFrame) -> pd.DataFrame:
+    """``links.csv`` made one-to-one: blank and repeated tmdbIds would fan out."""
     bridge = links[["movieId", "tmdbId"]].copy()
     bridge["tmdbId"] = pd.to_numeric(bridge["tmdbId"], errors="coerce")
     bridge = bridge.dropna(subset=["tmdbId"]).drop_duplicates("tmdbId").drop_duplicates("movieId")
     bridge["tmdbId"] = bridge["tmdbId"].astype("int64")
-    values = bridge["tmdbId"].map(by_tmdb)
-    keep = values.notna().to_numpy()
-    return pd.Series(
-        values[keep].to_numpy(),
-        index=pd.Index(bridge["movieId"][keep].to_numpy(), name="movieId"),
-        name=by_tmdb.name,
-    )
+    return bridge
+
+
+def _rekey(values: pd.Series, source: pd.Series, target: pd.Series, name: str) -> pd.Series:
+    mapped = source.map(values)
+    keep = mapped.notna().to_numpy()
+    index = pd.Index(target[keep].to_numpy(), name=name)
+    return pd.Series(mapped[keep].to_numpy(), index=index, name=values.name)
+
+
+def by_movie_id(by_tmdb: pd.Series, links: pd.DataFrame) -> pd.Series:
+    """Re-key a TMDb-indexed series to MovieLens ``movieId``, one to one."""
+    bridge = _bridge(links)
+    return _rekey(by_tmdb, bridge["tmdbId"], bridge["movieId"], "movieId")
+
+
+def by_tmdb_id(by_movie: pd.Series, links: pd.DataFrame) -> pd.Series:
+    """Re-key a movieId-indexed series to TMDb id, one to one."""
+    bridge = _bridge(links)
+    return _rekey(by_movie, bridge["movieId"], bridge["tmdbId"], "tmdb_id")
+
+
+def item_bias(ratings: pd.DataFrame, *, prior: float = 20.0) -> pd.Series:
+    """Each film's shrunk departure from the MovieLens mean, by ``movieId``.
+
+    The models' own estimator, ``(sum - n * mean) / (n + prior)``, so it can be
+    lent to a model fitted on another crowd and mean the same thing.
+    """
+    mean = ratings["rating"].mean()
+    grouped = ratings.groupby("movieId")["rating"].agg(["sum", "count"])
+    return ((grouped["sum"] - grouped["count"] * mean) / (grouped["count"] + prior)).rename("bias")
 
 
 def rated_tmdb_ids(links: pd.DataFrame, rated_movie_ids) -> set[int]:

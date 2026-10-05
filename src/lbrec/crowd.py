@@ -344,6 +344,23 @@ def ratings_by_film(ratings: pd.DataFrame, slug_map: pd.DataFrame) -> pd.DataFra
     return out
 
 
+def as_model_ratings(ratings: pd.DataFrame) -> pd.DataFrame:
+    """The crowd in the shape every `generalise` model reads.
+
+    ``userId`` is an integer code per member (strings would cost gigabytes over
+    20M rows), ``movieId`` is the TMDb id, and ``rating`` is halved onto the
+    0.5-5 scale the models clip to -- the scale a person's own export uses.
+    """
+    codes, _ = pd.factorize(ratings["member"])
+    return pd.DataFrame(
+        {
+            "userId": codes.astype("int32"),
+            "movieId": ratings["tmdb_id"].astype("int64").to_numpy(),
+            "rating": (ratings["rating"].astype("float32") / 2).to_numpy(),
+        }
+    )
+
+
 def crowd_item_bias(ratings: pd.DataFrame, *, prior: float = 20.0) -> pd.Series:
     """Each film's shrunk departure from the crowd's mean, on the 0.5-5 scale.
 

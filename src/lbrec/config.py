@@ -185,6 +185,11 @@ class Settings:
         return self.processed_dir / "crowd_films.parquet"
 
     @property
+    def crowd_vectors_path(self) -> Path:
+        """Dense content vectors for every film the crowd rated, keyed by TMDb id."""
+        return self.processed_dir / "crowd_content_vectors.parquet"
+
+    @property
     def pool_path(self) -> Path:
         """The candidate pool: recommendable films with a Letterboxd audience."""
         return self.processed_dir / "pool.parquet"

@@ -721,10 +721,6 @@ def movielens_item_features(
     Fitted on the catalogue's metadata only -- no ratings are involved, so this
     can be built once and reused for every user without leaking anything.
     """
-    from sklearn.decomposition import TruncatedSVD
-
-    from lbrec.features import build_film_features, build_preprocessor
-
     bridge = links.copy()
     bridge["tmdbId"] = pd.to_numeric(bridge["tmdbId"], errors="coerce").astype("Int64")
     bridge = bridge.dropna(subset=["tmdbId"]).drop_duplicates("tmdbId")
@@ -735,31 +731,84 @@ def movielens_item_features(
     if joined.empty:
         return pd.DataFrame()
 
-    frame = build_film_features(joined)
-    preprocessor = build_preprocessor().fit(frame)
+    matrix = _embed(joined, n_components=n_components)
+    return pd.DataFrame(matrix, index=pd.Index(joined["movieId"].to_numpy(), name="movieId"))
 
-    # Transformed in chunks into one preallocated float32 array. The preprocessor
-    # emits dense blocks, and a single `fit_transform` over 84k films holds the
-    # result plus sklearn's float64 intermediates at once -- several gigabytes for
-    # a matrix that only needs one and a half. Fitting stays over all rows, so the
-    # vocabularies and scalers are unchanged by the chunking.
-    matrix: np.ndarray | None = None
+
+#: Films the feature pipeline and its SVD are fitted on, at most. Above this the
+#: fit uses a random sample and every film is projected through it in chunks.
+FIT_ROWS = 100_000
+
+
+def catalogue_item_features(
+    films: pd.DataFrame, *, n_components: int = 128, fit_rows: int = FIT_ROWS, seed: int = 0
+) -> pd.DataFrame:
+    """Dense content vectors for catalogue films, keyed by ``tmdb_id``.
+
+    The Letterboxd counterpart of `movielens_item_features`: no MovieLens bridge,
+    and built for the ~330k films the crowd dumps cover rather than 85k.
+    """
+    films = films.drop_duplicates("tmdb_id")
+    if films.empty:
+        return pd.DataFrame()
+    matrix = _embed(films, n_components=n_components, fit_rows=fit_rows, seed=seed)
+    return pd.DataFrame(
+        matrix, index=pd.Index(films["tmdb_id"].astype("int64").to_numpy(), name="movieId")
+    )
+
+
+def _embed(
+    films: pd.DataFrame, *, n_components: int, fit_rows: int = FIT_ROWS, seed: int = 0
+) -> np.ndarray:
+    """Metadata -> preprocessor -> truncated SVD, without the full dense matrix.
+
+    The preprocessor emits ~5k dense columns. Materialised for 330k films that
+    is 6.5 GB before the SVD makes its own copies, so instead both are fitted on
+    at most ``fit_rows`` films and every film is then projected chunk by chunk;
+    only the reduced matrix is ever whole. Up to ``fit_rows`` films the fit uses
+    them all and the result is what a single ``fit_transform`` would give.
+
+    The sample is uniform over films, never the best-known ones: vocabularies
+    and components fitted on the head would describe famous films well and the
+    tail badly, which is the bias this project exists to remove.
+    """
+    from sklearn.decomposition import TruncatedSVD
+
+    from lbrec.features import build_film_features, build_preprocessor
+
+    frame = build_film_features(films)
+    if len(frame) > fit_rows:
+        chosen = np.random.default_rng(seed).choice(len(frame), size=fit_rows, replace=False)
+        sample = frame.iloc[np.sort(chosen)]
+    else:
+        sample = frame
+    preprocessor = build_preprocessor().fit(sample)
+
+    def transform(rows: pd.DataFrame) -> np.ndarray:
+        return np.asarray(preprocessor.transform(rows), dtype="float32")
+
+    fitted = np.vstack(
+        [
+            transform(sample.iloc[start : start + _TRANSFORM_CHUNK])
+            for start in range(0, len(sample), _TRANSFORM_CHUNK)
+        ]
+    )
+    usable = min(n_components, fitted.shape[1] - 1)
+    if usable < 1:
+        return np.vstack(
+            [
+                transform(frame.iloc[start : start + _TRANSFORM_CHUNK])
+                for start in range(0, len(frame), _TRANSFORM_CHUNK)
+            ]
+        )
+    svd = TruncatedSVD(n_components=usable, random_state=0).fit(fitted)
+    del fitted
+
+    out = np.empty((len(frame), usable), dtype="float32")
     for start in range(0, len(frame), _TRANSFORM_CHUNK):
         stop = min(start + _TRANSFORM_CHUNK, len(frame))
-        block = np.asarray(preprocessor.transform(frame.iloc[start:stop]), dtype="float32")
-        if matrix is None:
-            matrix = np.empty((len(frame), block.shape[1]), dtype="float32")
-        matrix[start:stop] = block
-    if matrix is None:
-        return pd.DataFrame()
-
-    usable = min(n_components, matrix.shape[1] - 1)
-    if usable >= 1:
-        matrix = TruncatedSVD(n_components=usable, random_state=0).fit_transform(matrix)
-    return pd.DataFrame(
-        np.asarray(matrix, dtype="float32"),
-        index=pd.Index(joined["movieId"].to_numpy(), name="movieId"),
-    )
+        out[start:stop] = svd.transform(transform(frame.iloc[start:stop]))
+    return out
 
 
 # --------------------------------------------------------------------------

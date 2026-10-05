@@ -20,6 +20,7 @@ from lbrec.crowd import (
     MATCHED,
     NO_RECORD,
     UNMATCHED,
+    as_model_ratings,
     build_pool,
     crowd_item_bias,
     latest_snapshot,
@@ -288,6 +289,18 @@ def test_mapping_report_counts_what_unmapped_slugs_would_have_added_to_the_pool(
     assert report.loc[LINKED, "pool_sized"] == 1
     assert report.loc[NO_RECORD, "slugs"] == 1
     assert report.loc[NO_RECORD, "pool_sized"] == 0
+
+
+def test_model_ratings_use_integer_users_tmdb_items_and_the_five_star_scale():
+    """A member's export is on 0.5-5; training on 1-10 would double every bias."""
+    crowd = pd.DataFrame(
+        {"member": ["ann", "bo", "ann"], "tmdb_id": [7, 7, 8], "rating": [10, 1, 7]}
+    )
+    out = as_model_ratings(crowd)
+    assert out["rating"].tolist() == [5.0, 0.5, 3.5]
+    assert out["movieId"].tolist() == [7, 7, 8]
+    assert out["userId"].tolist() == [0, 1, 0]
+    assert out["userId"].dtype == "int32"
 
 
 def test_crowd_bias_is_on_the_models_scale_and_shrunk():

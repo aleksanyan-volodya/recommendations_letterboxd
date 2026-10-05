@@ -532,6 +532,58 @@ def test_cold_items_are_hidden_from_the_global_fit():
     assert not set(model.item_bias_.index) & set(cold.tolist())
 
 
+def make_catalogue(n_films: int = 80, seed: int = 3) -> pd.DataFrame:
+    """Catalogue rows with every field the feature builder reads."""
+    rng = np.random.default_rng(seed)
+    words = [f"w{i}" for i in range(30)]
+    pick = lambda k: list(rng.choice(words, size=k, replace=False))  # noqa: E731
+    return pd.DataFrame(
+        {
+            "tmdb_id": np.arange(1000, 1000 + n_films),
+            "genres": [pick(2) for _ in range(n_films)],
+            "keywords": [pick(4) for _ in range(n_films)],
+            "directors": [pick(1) for _ in range(n_films)],
+            "cast": [pick(3) for _ in range(n_films)],
+            "production_countries": [pick(1) for _ in range(n_films)],
+            "year": rng.integers(1950, 2020, n_films),
+            "runtime": rng.integers(70, 180, n_films),
+            "vote_count": rng.integers(0, 5000, n_films),
+            "vote_average": rng.uniform(4, 8, n_films),
+            "original_language": rng.choice(["en", "fr", "ja"], n_films),
+            "overview": [" ".join(pick(8)) for _ in range(n_films)],
+        }
+    )
+
+
+def test_catalogue_vectors_are_keyed_by_tmdb_id_one_row_per_film():
+    from lbrec.generalise import catalogue_item_features
+
+    films = make_catalogue()
+    vectors = catalogue_item_features(pd.concat([films, films.head(5)]), n_components=8)
+    assert list(vectors.index) == films["tmdb_id"].tolist()
+    assert vectors.shape[1] == 8
+    assert np.isfinite(vectors.to_numpy()).all()
+
+
+def test_fitting_on_a_sample_still_embeds_every_film():
+    """The memory fix must not drop or blank the films outside the sample."""
+    from lbrec.generalise import catalogue_item_features
+
+    films = make_catalogue(n_films=80)
+    sampled = catalogue_item_features(films, n_components=8, fit_rows=40)
+    assert len(sampled) == 80
+    assert (np.abs(sampled.to_numpy()).sum(axis=1) > 0).all()
+
+
+def test_a_sample_as_large_as_the_data_is_the_full_fit():
+    from lbrec.generalise import catalogue_item_features
+
+    films = make_catalogue(n_films=60)
+    full = catalogue_item_features(films, n_components=8, fit_rows=60)
+    larger = catalogue_item_features(films, n_components=8, fit_rows=10_000)
+    assert np.allclose(full.to_numpy(), larger.to_numpy(), atol=1e-5)
+
+
 def test_a_measured_second_crowd_beats_a_guess_on_the_films_it_lends():
     """The experiment in miniature, run through the real protocol.
 
