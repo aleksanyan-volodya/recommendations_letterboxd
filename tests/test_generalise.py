@@ -263,6 +263,27 @@ def test_user_bias_is_shrunk_for_a_short_history():
     assert (many_ratings > one_rating).all(), "a long history should move the offset further"
 
 
+def test_plain_bias_model_is_unchanged_by_default():
+    """Every recorded `bias` number used the unshrunk mean offset."""
+    ratings = make_ratings(n_users=60, n_items=80, seed=22)
+    model = BiasModel().fit_global(ratings)
+    items = np.arange(5)
+    expected = model._items(items)
+    scores = model.score_user(items[:2], expected[:2] + 1.0, items)
+    assert model.name == "bias"
+    assert scores == pytest.approx(expected + 1.0)
+
+
+def test_bias_model_can_shrink_the_user_offset_like_the_bigger_models():
+    ratings = make_ratings(n_users=60, n_items=80, seed=22)
+    model = BiasModel(user_prior=10.0).fit_global(ratings)
+    items = np.arange(5)
+    expected = model._items(items)
+    scores = model.score_user(items[:2], expected[:2] + 1.0, items)
+    assert model.name == "bias_u10"
+    assert scores == pytest.approx(expected + 2.0 / 12.0)
+
+
 # --------------------------------------------------------------------------
 # the content tower
 # --------------------------------------------------------------------------

@@ -187,16 +187,28 @@ class BiasModel(ItemMean):
     The smallest model that is genuinely personalised. The user term is one
     number read off their history at inference, which is why it costs nothing
     and works from the first rating.
+
+    ``user_prior`` shrinks that term toward zero for a short history, as
+    `BiasedMF` and `ContentTower` already do. It defaults to 0 -- the plain mean
+    offset every recorded ``bias`` number was measured with -- so that comparing
+    against the bigger models separates what their extra terms buy from what
+    the shrinkage alone buys.
     """
 
-    name = "bias"
+    def __init__(self, *, prior_weight: float = 20.0, user_prior: float = 0.0) -> None:
+        super().__init__(prior_weight=prior_weight)
+        self.user_prior = user_prior
+
+    @property
+    def name(self) -> str:  # type: ignore[override]
+        return "bias" if self.user_prior == 0 else f"bias_u{self.user_prior:g}"
 
     def score_user(self, given_items, given_ratings, target_items) -> np.ndarray:
         item_scores = self._items(target_items)
         if not len(given_ratings):
             return item_scores
-        expected = self._items(given_items)
-        user_offset = float(np.mean(np.asarray(given_ratings, dtype=float) - expected))
+        residual = np.asarray(given_ratings, dtype=float) - self._items(given_items)
+        user_offset = float(residual.sum() / (len(residual) + self.user_prior))
         return item_scores + user_offset
 
 
