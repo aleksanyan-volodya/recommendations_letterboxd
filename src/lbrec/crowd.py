@@ -344,6 +344,20 @@ def ratings_by_film(ratings: pd.DataFrame, slug_map: pd.DataFrame) -> pd.DataFra
     return out
 
 
+def crowd_item_bias(ratings: pd.DataFrame, *, prior: float = 20.0) -> pd.Series:
+    """Each film's shrunk departure from the crowd's mean, on the 0.5-5 scale.
+
+    The same estimator the models use for their own crowd, so a bias borrowed
+    from here means the same kind of thing: ``(sum - n * mean) / (n + prior)``.
+    Halved from the stored 1-10 scale to match the models' rating scale.
+    """
+    stars = ratings["rating"].astype("float64") / 2.0
+    mean = stars.mean()
+    grouped = stars.groupby(ratings["tmdb_id"]).agg(["sum", "count"])
+    bias = (grouped["sum"] - grouped["count"] * mean) / (grouped["count"] + prior)
+    return bias.rename("bias")
+
+
 # --------------------------------------------------------------------------
 # the pool
 # --------------------------------------------------------------------------

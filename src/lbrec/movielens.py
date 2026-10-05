@@ -134,6 +134,26 @@ def link_films(film_map: pd.DataFrame, links: pd.DataFrame) -> pd.DataFrame:
     return joined
 
 
+def by_movie_id(by_tmdb: pd.Series, links: pd.DataFrame) -> pd.Series:
+    """Re-key a TMDb-indexed series to MovieLens ``movieId``.
+
+    ``links.csv`` is not one-to-one in either direction (blank and repeated
+    tmdbIds), so both sides are deduplicated first; a value never fans out to
+    two films or two values into one.
+    """
+    bridge = links[["movieId", "tmdbId"]].copy()
+    bridge["tmdbId"] = pd.to_numeric(bridge["tmdbId"], errors="coerce")
+    bridge = bridge.dropna(subset=["tmdbId"]).drop_duplicates("tmdbId").drop_duplicates("movieId")
+    bridge["tmdbId"] = bridge["tmdbId"].astype("int64")
+    values = bridge["tmdbId"].map(by_tmdb)
+    keep = values.notna().to_numpy()
+    return pd.Series(
+        values[keep].to_numpy(),
+        index=pd.Index(bridge["movieId"][keep].to_numpy(), name="movieId"),
+        name=by_tmdb.name,
+    )
+
+
 def rated_tmdb_ids(links: pd.DataFrame, rated_movie_ids) -> set[int]:
     """TMDb ids of films with at least one MovieLens rating.
 

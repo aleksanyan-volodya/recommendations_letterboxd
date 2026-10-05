@@ -15,6 +15,7 @@ import pytest
 
 from lbrec.movielens import (
     archive_prefix,
+    by_movie_id,
     coverage_by_popularity,
     imdb_tt,
     link_films,
@@ -118,6 +119,13 @@ def test_link_films_ignores_rows_with_no_tmdb_id(archive: Path, tmp_path: Path):
     film_map = pd.DataFrame([{"film_key": "aaaa", "tmdb_id": 862, "media_type": "movie"}])
     linked = link_films(film_map, load(out, "links"))
     assert len(linked) == 1  # no fan-out from the null-tmdbId row
+
+
+def test_rekeying_by_movie_id_never_fans_out():
+    """links.csv repeats and blanks tmdbIds; one value must land on one film."""
+    links = pd.DataFrame({"movieId": [1, 2, 3, 4], "tmdbId": [10.0, 10.0, None, 30.0]})
+    out = by_movie_id(pd.Series({10: 0.5, 30: -0.2, 99: 1.0}), links)
+    assert out.to_dict() == {1: 0.5, 4: -0.2}
 
 
 def test_coverage_is_reported_per_popularity_decile():

@@ -60,6 +60,13 @@ ITEM_BIAS_NONE = "none"
 ITEM_BIAS_PREDICTED = "predicted"
 ITEM_BIAS_STRATEGIES = (ITEM_BIAS_KNOWN, ITEM_BIAS_NONE, ITEM_BIAS_PREDICTED)
 
+#: A fourth option, which needs data the other three do not: take ``b_i`` from
+#: a *second* crowd that has rated the film, calibrated onto this crowd's scale.
+#: Where ``predicted`` guesses a bias from metadata, this one is measured --
+#: just by different people. Films neither crowd rated fall back to
+#: ``predicted``.
+ITEM_BIAS_BORROWED = "borrowed"
+
 
 @dataclass(frozen=True)
 class UserSplit:
@@ -358,6 +365,7 @@ class ContentTower:
         item_features: pd.DataFrame,
         *,
         item_bias: str = ITEM_BIAS_KNOWN,
+        borrowed_bias: pd.Series | None = None,
         bias_weight: float = 1.0,
         item_prior: float = 20.0,
         user_prior: float = 10.0,
@@ -373,6 +381,11 @@ class ContentTower:
         see ``ITEM_BIAS_STRATEGIES``. It is the project's central fairness knob,
         not a tuning detail.
 
+        ``borrowed_bias`` is a second crowd's item biases, indexed like
+        ``item_features`` and on the same rating scale: each film's shrunk
+        departure from *that* crowd's mean. Required by ``item_bias="borrowed"``,
+        and when given it also reads the history (see ``_history_baseline``).
+
         ``bias_weight`` scales the crowd term when ranking candidates, tracing the
         frontier between the two corners: 1.0 trusts the crowd fully, 0.0 is
         exactly ``item_bias="none"`` and ranks on taste alone. It exists because
@@ -381,10 +394,16 @@ class ContentTower:
         the fair setting ranks far worse -- so the useful question is where on the
         curve to stand, not which end to pick.
         """
-        if item_bias not in ITEM_BIAS_STRATEGIES:
+        known_strategies = (*ITEM_BIAS_STRATEGIES, ITEM_BIAS_BORROWED)
+        if item_bias not in known_strategies:
             raise ValueError(
-                f"unknown item_bias {item_bias!r}; expected one of {sorted(ITEM_BIAS_STRATEGIES)}"
+                f"unknown item_bias {item_bias!r}; expected one of {sorted(known_strategies)}"
             )
+        if item_bias == ITEM_BIAS_BORROWED and borrowed_bias is None:
+            raise ValueError("item_bias='borrowed' needs a borrowed_bias table")
+        self.borrowed_bias = None if borrowed_bias is None else borrowed_bias.astype("float64")
+        self.borrow_map_: tuple[float, float] | None = None
+        self.borrow_fit_: dict[str, float] = {}
         self.features_ = item_features.astype("float32")
         # Unit-norm rows: otherwise films with more metadata dominate every
         # profile purely by having larger vectors, which is a popularity
@@ -417,12 +436,44 @@ class ContentTower:
             (grouped["sum"] - grouped["count"] * self.global_mean_)
             / (grouped["count"] + self.item_prior)
         ).astype("float32")
+        self.item_count_ = grouped["count"]
 
-        if self.item_bias == ITEM_BIAS_PREDICTED:
+        if self.borrowed_bias is not None:
+            self._calibrate_borrowed()
+        if self.item_bias in (ITEM_BIAS_PREDICTED, ITEM_BIAS_BORROWED):
             self._learn_item_bias()
         if self.learn_weights:
             self._learn_weights(ratings)
         return self
+
+    def _calibrate_borrowed(self) -> None:
+        """Map the second crowd's biases onto this crowd's scale.
+
+        Two crowds disagree on scale, not only on films. On films both rated,
+        MovieLens ``b_i`` is about 0.6 x Letterboxd's for well-known titles:
+        cinephiles separate films more sharply. Uncalibrated, a borrowed bias
+        would outrank a measured one on spread alone.
+
+        The map is a line fitted on films both crowds rated, using only films
+        with at least ``item_prior`` ratings here -- below that the target is
+        mostly shrinkage, and the slope would learn the prior rather than the
+        film. Only the training fit enters it, so no test user does.
+        """
+        assert self.borrowed_bias is not None
+        supported = self.item_count_.index[self.item_count_ >= self.item_prior]
+        shared = supported.intersection(self.borrowed_bias.index)
+        if len(shared) < 3:
+            return
+        lent = self.borrowed_bias.loc[shared].to_numpy()
+        own = self.item_bias_.loc[shared].to_numpy(dtype="float64")
+        slope, intercept = np.polyfit(lent, own, 1)
+        self.borrow_map_ = (float(intercept), float(slope))
+        self.borrow_fit_ = {
+            "films": float(len(shared)),
+            "corr": float(np.corrcoef(lent, own)[0, 1]),
+            "slope": float(slope),
+            "intercept": float(intercept),
+        }
 
     def _learn_item_bias(self) -> None:
         """Learn to predict a film's crowd bias from its content.
@@ -446,16 +497,23 @@ class ContentTower:
         ``known`` leaves an unrated film at zero -- "exactly average" -- while a
         famous film keeps a large positive bias it earned from votes the obscure
         film never had the chance to receive. That is popularity bias entering
-        through the back door, so the other two strategies exist to escape it:
-        ``none`` refuses the term entirely and ranks on content alone, and
-        ``predicted`` gives an unrated film the bias its metadata implies.
+        through the back door, so the other strategies exist to escape it:
+        ``none`` refuses the term entirely and ranks on content alone,
+        ``predicted`` gives an unrated film the bias its metadata implies, and
+        ``borrowed`` gives it the bias a second crowd measured.
         """
         if strategy == ITEM_BIAS_NONE:
             return np.zeros(len(items), dtype=float)
 
         bias = pd.Series(items).map(self.item_bias_).to_numpy(dtype=float)
         missing = np.isnan(bias)
-        if strategy == ITEM_BIAS_PREDICTED and missing.any():
+        if strategy == ITEM_BIAS_BORROWED and missing.any() and self.borrow_map_ is not None:
+            assert self.borrowed_bias is not None
+            intercept, slope = self.borrow_map_
+            lent = pd.Series(np.asarray(items)[missing]).map(self.borrowed_bias)
+            bias[missing] = intercept + slope * lent.to_numpy(dtype=float)
+            missing = np.isnan(bias)
+        if strategy in (ITEM_BIAS_PREDICTED, ITEM_BIAS_BORROWED) and missing.any():
             if self.bias_weights_ is None:
                 bias[missing] = 0.0
             else:
@@ -495,10 +553,12 @@ class ContentTower:
         built from ``rating - expected``, so without ``b_i`` a user who rates a
         masterpiece 5 looks enthusiastic rather than ordinary, and their taste
         vector drifts toward whatever is simply good.
+
+        For the same reason it takes the best estimate on offer: a second
+        crowd's measurement when one was given, a content guess otherwise.
         """
-        return self.global_mean_ + self._item_bias_for(
-            np.asarray(items), strategy=ITEM_BIAS_PREDICTED
-        )
+        strategy = ITEM_BIAS_PREDICTED if self.borrowed_bias is None else ITEM_BIAS_BORROWED
+        return self.global_mean_ + self._item_bias_for(np.asarray(items), strategy=strategy)
 
     def _profile(self, items: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, float]:
         residual = values - self._history_baseline(items)
@@ -571,6 +631,11 @@ class ContentTower:
         "nobody has rated this" means, both in the protocol and for the 1.07M
         catalogue films MovieLens has never seen. The stratified ranker can
         therefore use it at inference time for a stranger, not just in evaluation.
+
+        A film only the *second* crowd rated still counts as unknown here. Its
+        borrowed bias is measured, but by other people on a calibrated scale;
+        whether that makes it comparable is exactly what ``tower_borrowed``
+        against ``stratified_tower_borrowed`` measures.
         """
         return np.isin(np.asarray(items), self.item_bias_.index.to_numpy())
 

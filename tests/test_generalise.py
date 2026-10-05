@@ -455,6 +455,63 @@ def test_unknown_item_bias_strategy_is_rejected():
         ContentTower(make_item_features(n_items=10), item_bias="popularity")
 
 
+def borrowed_tower(seed: int = 21, **kwargs):
+    """A tower whose second crowd rates every film exactly twice as sharply.
+
+    Films 0-59 are rated by the training crowd; films 60-119 only by the second
+    one, which gives them a bias of 0.4 (i.e. 0.2 on the training crowd's scale).
+    """
+    from lbrec.generalise import ContentTower
+
+    ratings = make_ratings(n_users=120, n_items=60, seed=seed)
+    features = make_item_features(n_items=130, n_dims=6)
+    own = ContentTower(features, learn_weights=False).fit_global(ratings).item_bias_
+    lent = pd.concat([2.0 * own.astype("float64"), pd.Series(0.4, index=range(60, 120))])
+    model = ContentTower(
+        features, item_bias="borrowed", borrowed_bias=lent, learn_weights=False, **kwargs
+    ).fit_global(ratings)
+    return model
+
+
+def test_borrowed_bias_is_calibrated_onto_the_training_crowds_scale():
+    """Uncalibrated, a sharper crowd's biases would win on spread alone."""
+    model = borrowed_tower()
+    intercept, slope = model.borrow_map_
+    assert slope == pytest.approx(0.5, abs=1e-4)
+    assert intercept == pytest.approx(0.0, abs=1e-4)
+    assert model._baseline(np.array([100]))[0] == pytest.approx(model.global_mean_ + 0.2)
+
+
+def test_a_borrowed_bias_never_overrides_a_measured_one():
+    model = borrowed_tower()
+    measured = model.global_mean_ + float(model.item_bias_.loc[3])
+    assert model._baseline(np.array([3]))[0] == pytest.approx(measured, abs=1e-5)
+
+
+def test_films_neither_crowd_rated_fall_back_to_the_content_guess():
+    from lbrec.generalise import ContentTower
+
+    borrowed = borrowed_tower()
+    guessed = ContentTower(
+        borrowed.features_, item_bias="predicted", learn_weights=False
+    ).fit_global(make_ratings(n_users=120, n_items=60, seed=21))
+    orphans = np.arange(120, 130)  # in the features, rated by nobody
+    assert borrowed._baseline(orphans) == pytest.approx(guessed._baseline(orphans), abs=1e-5)
+
+
+def test_a_borrowed_bias_also_reads_the_history():
+    """A film only the second crowd knows is still a measured film when reading taste."""
+    model = borrowed_tower()
+    assert model._history_baseline(np.array([100]))[0] == pytest.approx(model.global_mean_ + 0.2)
+
+
+def test_borrowed_strategy_needs_a_second_crowd():
+    from lbrec.generalise import ContentTower
+
+    with pytest.raises(ValueError, match="borrowed_bias"):
+        ContentTower(make_item_features(n_items=10), item_bias="borrowed")
+
+
 def test_cold_items_are_hidden_from_the_global_fit():
     """The point of the protocol: the model must not know the cold films.
 
@@ -473,6 +530,48 @@ def test_cold_items_are_hidden_from_the_global_fit():
 
     assert not per_user.empty
     assert not set(model.item_bias_.index) & set(cold.tolist())
+
+
+def test_a_measured_second_crowd_beats_a_guess_on_the_films_it_lends():
+    """The experiment in miniature, run through the real protocol.
+
+    The second crowd is the training users again, but *with* the cold films and
+    on a sharper scale -- a crowd that measured what the first one never saw.
+    Its calibrated bias must predict the hidden films better than a guess from
+    metadata that, here, carries no information about quality at all.
+    """
+    from lbrec.generalise import (
+        ContentTower,
+        StratifiedRanker,
+        cold_item_split,
+        evaluate_cold_items,
+    )
+
+    ratings = make_ratings(n_users=160, n_items=90, seed=19)
+    split = split_users(ratings, n_test_users=30, min_ratings=20, seed=0)
+    cold = cold_item_split(ratings, share=0.25, seed=0)
+    features = make_item_features(n_items=90, n_dims=6)
+
+    second = ratings[ratings["userId"].isin(set(split.train_users.tolist()))]
+    stats = second.groupby("movieId")["rating"].agg(["sum", "count"])
+    lent = 2.0 * (stats["sum"] - stats["count"] * second["rating"].mean()) / (stats["count"] + 20)
+
+    models = [
+        ContentTower(features, item_bias="predicted", learn_weights=False),
+        ContentTower(features, item_bias="borrowed", borrowed_bias=lent, learn_weights=False),
+        StratifiedRanker(
+            ContentTower(features, item_bias="borrowed", borrowed_bias=lent, learn_weights=False)
+        ),
+    ]
+    per_user = evaluate_cold_items(models, ratings, split, cold, given_sizes=(10,), seed=0)
+    cold_rmse = per_user.groupby("model")["rmse_cold"].mean()
+
+    assert set(cold_rmse.index) == {
+        "tower_predicted",
+        "tower_borrowed",
+        "stratified_tower_borrowed",
+    }
+    assert cold_rmse["tower_borrowed"] < cold_rmse["tower_predicted"]
 
 
 def test_cold_item_scoring_never_shows_a_cold_film_in_the_history():

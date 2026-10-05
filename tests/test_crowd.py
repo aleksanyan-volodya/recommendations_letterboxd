@@ -21,6 +21,7 @@ from lbrec.crowd import (
     NO_RECORD,
     UNMATCHED,
     build_pool,
+    crowd_item_bias,
     latest_snapshot,
     map_slugs,
     mapping_report,
@@ -287,6 +288,17 @@ def test_mapping_report_counts_what_unmapped_slugs_would_have_added_to_the_pool(
     assert report.loc[LINKED, "pool_sized"] == 1
     assert report.loc[NO_RECORD, "slugs"] == 1
     assert report.loc[NO_RECORD, "pool_sized"] == 0
+
+
+def test_crowd_bias_is_on_the_models_scale_and_shrunk():
+    """Stored ratings are 1-10; the models work on 0.5-5."""
+    crowd = pd.DataFrame(
+        {"member": ["a", "b", "c", "d"], "tmdb_id": [1, 1, 2, 2], "rating": [10, 10, 2, 2]}
+    )
+    bias = crowd_item_bias(crowd, prior=2.0)
+    # mean 3.0 on the 0.5-5 scale; film 1: (10 - 2*3) / (2+2) = 1.0
+    assert bias.loc[1] == pytest.approx(1.0)
+    assert bias.loc[2] == pytest.approx(-1.0)
 
 
 def test_the_pool_counts_distinct_members():
